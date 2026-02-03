@@ -6,7 +6,7 @@ import seaborn as sns
 FILE = 'Dataset/eventTimes.mat'
 NEURON_NUMBER = 9
 
-NEURON_COUNT = 1007
+N_NEURONS = 1007
 N_TRIALS = 200
 N_ODORS = 8
 TRIALS_PER_ODOR = int(N_TRIALS / N_ODORS)
@@ -15,6 +15,8 @@ N_ZSCORES = 504
 N_BINS = 80
 
 START = -2
+ODOR_START = 0
+ODOR_END = 4
 END = 10    
 BIN_WIDTH = (END - START) / N_BINS
 LAST_BIN_BEFORE_ODOR = int(-START / BIN_WIDTH)
@@ -137,6 +139,27 @@ def gen_fig_1f(neurons, odor_starts, odors):
     plt.tight_layout()
     plt.show()
 
+def population_vector(neurons, odor_starts, odors):
+    spike_counts = np.zeros((N_NEURONS, N_TRIALS))
+    for i in range(N_NEURONS):
+        neuron_spike_times = np.array(neurons[i], dtype=float).flatten()
+        trials, odors = trial_odor_pairs(neuron_spike_times, odor_starts, odors, START, END)
+        for j in range(N_TRIALS):
+            spike_counts[i,j] = sum(1 for t in trials[j] if 0 < t < 4) # number of spikes during odor presentation
+    
+    # normalize each column by total spikes per trial
+    spike_counts_norm = spike_counts / spike_counts.sum(axis=0)
+    return spike_counts_norm
+
+def plot_correlation_pop_vector(neurons, odor_starts, odors):
+    spike_counts = population_vector(neurons, odor_starts, odors)
+    corr = spike_counts.T @ spike_counts
+    
+    plt.imshow(corr)
+    plt.colorbar()
+    plt.show()
+    
+
 
 def main():
     eventTimes = mat73.loadmat(FILE)  
@@ -149,7 +172,9 @@ def main():
 
     # gen_fig_a(neuron)
     # gen_fig_c(neuron, odor_starts, odors)
-    gen_fig_1f(neuron_stims_struct, odor_starts, odors)
+    # gen_fig_1f(neuron_stims_struct, odor_starts, odors)
+    plot_correlation_pop_vector(neuron_stims_struct, odor_starts, odors)
+
 
 
 if __name__ == "__main__":
