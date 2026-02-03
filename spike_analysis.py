@@ -1,6 +1,7 @@
 import mat73
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import seaborn as sns
 
 FILE = 'Dataset/eventTimes.mat'
@@ -139,27 +140,45 @@ def gen_fig_1f(neurons, odor_starts, odors):
     plt.tight_layout()
     plt.show()
 
-def population_vector(neurons, odor_starts, odors):
+def population_vector_corrs(neurons, odor_starts, odors):
     spike_counts = np.zeros((N_NEURONS, N_TRIALS))
+    corrs_by_odor = np.zeros((N_ODORS, TRIALS_PER_ODOR-1))
     for i in range(N_NEURONS):
         neuron_spike_times = np.array(neurons[i], dtype=float).flatten()
         trials, odors = trial_odor_pairs(neuron_spike_times, odor_starts, odors, START, END)
         for j in range(N_TRIALS):
-            spike_counts[i,j] = sum(1 for t in trials[j] if 0 < t < 4) # number of spikes during odor presentation
-    
+            # number of spikes during odor presentation
+            spike_counts[i,j] = sum(1 for t in trials[j] if ODOR_START < t < ODOR_END) 
     # normalize each column by total spikes per trial
     spike_counts_norm = spike_counts / spike_counts.sum(axis=0)
-    return spike_counts_norm
+    assert np.all(np.isfinite(spike_counts_norm))
 
-def plot_correlation_pop_vector(neurons, odor_starts, odors):
-    spike_counts = population_vector(neurons, odor_starts, odors)
-    corr = spike_counts.T @ spike_counts
+    corr = spike_counts_norm.T @ spike_counts_norm
     
-    plt.imshow(corr)
-    plt.colorbar()
+    for i in range(N_ODORS):
+        for j in range(TRIALS_PER_ODOR - 1):
+            idx = i*TRIALS_PER_ODOR + j
+            corrs_by_odor[i, j] = spike_counts_norm[:, idx] @ spike_counts_norm[:, idx+1]
+            assert np.isclose(corrs_by_odor[i, j], corr[idx+1, idx], rtol=0.01)
+
+    return corr, corrs_by_odor
+
+
+def plot_corr_pop_vector(neurons, odor_starts, odors):
+    corr, corrs_by_odor = population_vector_corrs(neurons, odor_starts, odors)
+
+    fig, axs = plt.subplots(1, 4, figsize=(20, 5))
+
+    corr_img = axs[0].imshow(corr)
+    fig.colorbar(corr_img, ax=axs[0])
+
+    axs[2].plot(corrs_by_odor.T)
+    axs[2].legend([f"{i}" for i in range(N_ODORS)])
+    axs[2].set_xlabel("Trials")
+    axs[2].set_xlabel("Consecutive trials corr")
+
     plt.show()
     
-
 
 def main():
     eventTimes = mat73.loadmat(FILE)  
@@ -173,7 +192,7 @@ def main():
     # gen_fig_a(neuron)
     # gen_fig_c(neuron, odor_starts, odors)
     # gen_fig_1f(neuron_stims_struct, odor_starts, odors)
-    plot_correlation_pop_vector(neuron_stims_struct, odor_starts, odors)
+    plot_corr_pop_vector(neuron_stims_struct, odor_starts, odors)
 
 
 
