@@ -3,20 +3,21 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 from scipy.io import loadmat
+from scipy.sparse import lil_matrix, csr_matrix
 import seaborn as sns
 
 DIR = 'Dataset1'
-FILE_NAME = 'eventTimes.mat'
-# FILE_NAME = 'APCdata.mat'
+FILE_NAME = 'eventTimes.mat' # APCdata.mat, eventTimes.mat
 DATA = f'{DIR}/{FILE_NAME}'
 NEURON_NUMBER = 9
+RECORDING_LENGTH = 25200 # 7h
 
 N_TRIALS = 200
 N_ODORS = 8
 TRIALS_PER_ODOR = int(N_TRIALS / N_ODORS)
 
 N_ZSCORES = 504
-N_BINS = 80
+N_BINS = 20
 
 START = -2
 ODOR_START = 0
@@ -38,14 +39,36 @@ COLORS = [
     '#7f7f7f'   # gray
 ]
 
+def gen_M(neurons, dt):
+    ### M generation takes long time, even with dt=0.1 s...
+    ### Recording time is 7h. How did Sam do it?
+    T = int(RECORDING_LENGTH / dt)
+    M = lil_matrix((N_NEURONS, T))
+    bins = np.linspace(0, T, T+1)
+
+    for i in range(N_NEURONS):
+        neuron = np.array(neurons[i], dtype=float).flatten()
+        indices = np.searchsorted(neuron, bins)
+        M[i, :] = np.diff(indices)
+    
+    M = M.tocsr().todense()
+    return M
+
+def gen_ccgs(neurons, lags, dt):
+    """
+    Generate all CCGs for spike matrix M with dimensions N x T (neurons x times)
+    """
+    M = gen_M(neurons, dt)
+
+
 # limit pairwise conversions 
 # ASK SAM how to compute auto correlogram, Andrew seems to remember he has some clever way of doing it
-def gen_fig_a(neuron_spike_times):
+def gen_fig_a(neuron):
     # Computes pairwise intervals between stims
 
-    n = len(neuron_spike_times)
+    n = len(neuron)
     i, j = np.triu_indices(n, k=1) # upper triangle indices (i < j)
-    diffs = np.abs(neuron_spike_times[i] - neuron_spike_times[j])
+    diffs = np.abs(neuron[i] - neuron[j])
 
     plt.figure(figsize=(10, 6))
     plt.hist(diffs, bins=500, edgecolor='black', alpha=0.7)
@@ -57,11 +80,11 @@ def gen_fig_a(neuron_spike_times):
     plt.tight_layout()
     plt.show()
 
-def trial_odor_pairs(neuron_spike_times, odor_starts, odors, START, END, sorted=True):
+def trial_odor_pairs(neuron, odor_starts, odors, start, end, sorted=True):
     trials = []
     for t in odor_starts:
-        cond = (neuron_spike_times > t + START) & (neuron_spike_times < t + END)
-        trials.append(neuron_spike_times[cond] - t)
+        cond = (neuron > t + start) & (neuron < t + end)
+        trials.append(neuron[cond] - t)
 
     # sort rasters based on odor number
     if sorted:
@@ -83,9 +106,9 @@ def neuron_spike_rates(trials):
     return spike_rate_odor_mu, edges
 
 
-def gen_fig_c(neuron_spike_times, odor_starts, odors):
+def gen_fig_c(neuron, odor_starts, odors):
     num_trials = len(odor_starts)
-    trials, odors = trial_odor_pairs(neuron_spike_times, odor_starts, odors, START, END)
+    trials, odors = trial_odor_pairs(neuron, odor_starts, odors, START, END)
 
     _, ax = plt.subplots(figsize=(9, 9)) 
     for i, spikes in enumerate(trials):
@@ -121,8 +144,8 @@ def gen_fig_1f(neurons, odor_starts, odors):
     z_scores = np.zeros((N_ZSCORES, N_BINS-1), dtype=float)
 
     for i in range(N_ZSCORES // N_ODORS):
-        neuron_spike_times = np.array(neurons[i], dtype=float).flatten()
-        trials, odors = trial_odor_pairs(neuron_spike_times, odor_starts, odors, START, END)
+        neuron = np.array(neurons[i], dtype=float).flatten()
+        trials, odors = trial_odor_pairs(neuron, odor_starts, odors, START, END)
         spike_rate_odor_mu, _ = neuron_spike_rates(trials)
 
         spikes_without_odor = spike_rate_odor_mu[:, :LAST_BIN_BEFORE_ODOR]
@@ -145,15 +168,34 @@ def gen_fig_1f(neurons, odor_starts, odors):
     plt.tight_layout()
     plt.show()
 
-def population_vector_corrs(neurons, odor_starts, odors):
+def gen_spike_counts(neurons, odor_starts, odors, sorted=True, times=[]):
+    """
+    Population vectors across trials N_NEURONS x N_TRIALS
+    If times = []: total spike count during 4 seconds of odor presentation
+    If times = [t_start, t_end]: total spike count between t_start, t_end
+    """
+
+    t_start = times[0] if times else ODOR_START
+    t_end = times[1] if times else ODOR_END
+
     spike_counts = np.zeros((N_NEURONS, N_TRIALS))
-    corrs_by_odor = np.zeros((N_ODORS, TRIALS_PER_ODOR-1))
     for i in range(N_NEURONS):
-        neuron_spike_times = np.array(neurons[i], dtype=float).flatten()
-        trials, odors = trial_odor_pairs(neuron_spike_times, odor_starts, odors, START, END, sorted=False)
+        neuron = np.array(neurons[i], dtype=float).flatten()
+        trials, odors = trial_odor_pairs(neuron, odor_starts, odors, START, END, sorted)
         for j in range(N_TRIALS):
-            # number of spikes during odor presentation
-            spike_counts[i,j] = sum(1 for t in trials[j] if ODOR_START < t < ODOR_END) 
+            spike_counts[i,j] = sum(1 for t in trials[j] if t_start < t < t_end) 
+    
+    return spike_counts
+
+def population_vector_corrs(neurons, odor_starts, odors):
+    """
+    Generate L1/L2 corrs, Pearson's corr
+    Average Pearson's corr between trials across all odors
+    """
+    spike_counts = gen_spike_counts(neurons, odor_starts, odors, sorted=False)
+    spike_counts_sorted = gen_spike_counts(neurons, odor_starts, odors, sorted=True)
+    corrs_by_odor = np.zeros((N_ODORS, TRIALS_PER_ODOR-1))
+
     # spike_counts_norm is cosine distance dot product
     spike_counts_L1_norm = spike_counts / spike_counts.sum(axis=0)
     spike_counts_L2_norm = spike_counts / np.linalg.norm(spike_counts, axis=0, keepdims=True)
@@ -162,8 +204,10 @@ def population_vector_corrs(neurons, odor_starts, odors):
 
     corr_L1 = spike_counts_L1_norm.T @ spike_counts_L1_norm
     corr_L2 = spike_counts_L2_norm.T @ spike_counts_L2_norm
-    p_corr = np.corrcoef(spike_counts)
-    p_corr_shuffle = np.corrcoef(spike_counts, np.random.permutation(spike_counts))
+    p_corr = np.corrcoef(spike_counts, rowvar=False)
+    p_corr_sorted = np.corrcoef(spike_counts_sorted, rowvar=False)
+
+    p_corr_avgs = corr_novel_familiar(neurons, odor_starts, odors, p_corr_sorted)
     
     # for i in range(N_ODORS):
     #     for j in range(TRIALS_PER_ODOR - 1):
@@ -175,13 +219,35 @@ def population_vector_corrs(neurons, odor_starts, odors):
     for i in range(N_TRIALS-1):
         corrs_by_odor_new[i] = spike_counts_L2_norm[:, i] @ spike_counts_L2_norm[:, i+1]
 
-    return corr_L1, corr_L2, p_corr, p_corr_shuffle, corrs_by_odor_new
+    return corr_L1, corr_L2, p_corr, p_corr_sorted, p_corr_avgs, corrs_by_odor_new
+
+def corr_novel_familiar(neurons, odor_starts, odors, p_corr_sorted):
+    """
+    Pearson's correlation between consecutive trials
+    Averaged across all 8 odors
+    """
+    p_corr_avgs = np.zeros(TRIALS_PER_ODOR-1)
+    spike_counts = gen_spike_counts(neurons, odor_starts, odors, sorted=True)
+
+    for i in range(TRIALS_PER_ODOR-1):
+        p_corr_sum_across_odor = 0
+        for j in range(N_ODORS):
+            idx = j*TRIALS_PER_ODOR + i
+            p_corr_sum_across_odor += np.corrcoef(spike_counts[:, idx], spike_counts[:, idx+1])[0,1]
+            assert np.isclose(p_corr_sorted[idx, idx+1], np.corrcoef(spike_counts[:, idx], spike_counts[:, idx+1])[0,1], rtol=0.01)
+        p_corr_avgs[i] = p_corr_sum_across_odor / N_ODORS
+    
+    return p_corr_avgs
 
 
 def plot_corr_pop_vector(neurons, odor_starts, odors):
-    corr_L1, corr_L2, p_corr, p_corr_shuffle, corrs_by_odor = population_vector_corrs(neurons, odor_starts, odors)
+    corr_L1, corr_L2, p_corr, p_corr_sorted, p_corr_avgs, corrs_by_odor = population_vector_corrs(neurons, odor_starts, odors)
 
-    fig, axs = plt.subplots(1, 4, figsize=(20, 5))
+    # corr_L1 = corr_L1[:25, :25]
+    # corr_L2 = corr_L2[:25, :25]
+    # p_corr = p_corr[:25, :25]
+
+    fig, axs = plt.subplots(1, 5, figsize=(20, 5))
     fig.suptitle(f"{DIR} Sorted by Trial Number")
 
     corr_img = axs[0].imshow(corr_L1)
@@ -196,9 +262,13 @@ def plot_corr_pop_vector(neurons, odor_starts, odors):
     fig.colorbar(corr_img2, ax=axs[2])
     axs[2].set_title("Pearson's Corr")
 
-    corr_img3 = axs[3].imshow(p_corr_shuffle)
-    fig.colorbar(corr_img3, ax=axs[3])
-    axs[3].set_title("Pearson's Corr Random Shuffle")
+    # corr_img3 = axs[3].imshow(p_corr_shuffle)
+    # fig.colorbar(corr_img3, ax=axs[3])
+    # axs[3].set_title("Pearson's Corr Random Shuffle")
+
+    axs[4].plot(p_corr_avgs)
+    axs[4].set_xlabel("Trial Pair Corrs (1 --> pcorr(x1, x2))")
+    axs[4].set_title("Pearson's Corr Between Consecutive Trials")
 
     # axs[2].plot(corrs_by_odor.T)
     # axs[2].plot(corrs_by_odor)
@@ -207,32 +277,79 @@ def plot_corr_pop_vector(neurons, odor_starts, odors):
     # axs[2].set_xlabel("Consecutive trials corr")
 
     plt.show()
+
+
+def trial_zscores(neurons, odor_starts, odors):
+    """
+    Calculate z scores across 200 trials
+    ---> mu/sigma: spontaneous firing rate averaged/std across all neurons during this trial
+    ---> 200 heatmaps with N_NEURONS rows each
+
+    total_spike_times[n][t] = spike times for neuron n on trial t
+    """
+    z_scores = np.zeros((N_NEURONS, N_BINS-1, N_TRIALS), dtype=float)
+    # mu, sigma are calculated over 2s of spontaneous firing
+    # in poisson process, mu and variance scale linearly with time
+    poisson_scaler = BIN_WIDTH/2
+
+    spike_counts_spontaneous = gen_spike_counts(neurons, odor_starts, odors, sorted=False, times=[START,ODOR_START])
+    for i in range(N_NEURONS):
+        neuron = np.array(neurons[i], dtype=float).flatten()
+        trials, _ = trial_odor_pairs(neuron, odor_starts, odors, START, END, sorted=False)
+        for j, trial in enumerate(trials):
+            trial_pop_vector_spon = spike_counts_spontaneous[:, j]
+            mu_i, sigma_i = np.mean(trial_pop_vector_spon), np.std(trial_pop_vector_spon)
+            counts, _ = np.histogram(trial, bins=BINS)
+            # print(f'TRIAL: {trial}')
+            # print(f'COUNTS: {counts} --> MU {mu_i*poisson_scaler}, {sigma_i*np.sqrt(poisson_scaler)}')
+            z_scores[i, :, j] = (counts - mu_i*poisson_scaler)/(sigma_i*np.sqrt(poisson_scaler))
     
+    # sort z scores based on trial 1
+    sorted_neurons = np.argsort(-np.nansum(z_scores[:, :, 0], axis=1))
+    # print(sorted_neurons[:50])
+    z_scores = z_scores[sorted_neurons, :, :]
+
+    _, axs = plt.subplots(20, 10, figsize=(30, 100))
+    axs = axs.flatten()
+    for i in range(200):
+        print(i)
+        sns.heatmap(z_scores[:, :, i],ax=axs[i],cmap='RdBu_r',
+        center=0,vmin=-3,vmax=3,cbar=(i == 0), cbar_kws={'label': 'Z-score'})
+        axs[i].set_title(f'Trial {i+1}')
+
+    plt.tight_layout()
+    # plt.show()
+    plt.savefig("zscores_by_trial.png", dpi=300, bbox_inches="tight")
+
+    
+
 
 def main():
     global N_NEURONS
-    
+
     if DIR == 'Dataset1':
         eventTimes = mat73.loadmat(DATA) 
-        neuron_stims_struct = eventTimes['spikeTiming']['spikeTimesByUnit']
+        neurons = eventTimes['spikeTiming']['spikeTimesByUnit']
         odor_starts = np.array(eventTimes['stimTiming']['odorStarts'], dtype=float) # (200,)
         odors = np.array(eventTimes['stimTiming']['manifold_bottleids'][:,1], dtype=int) # (200,)
 
     else:
         eventTimes = loadmat(DATA)
-        neuron_stims_struct = eventTimes['spikeTimes'].squeeze()
+        neurons = eventTimes['spikeTimes'].squeeze()
         odor_starts = np.array(eventTimes['stimTimes'], dtype=float)
-        odors = np.array(eventTimes['stimIDs'], dtype=int)
+        odors = np.array(eventTimes['stimIDs'], dtype=int).ravel()
+
     
-    N_NEURONS = len(neuron_stims_struct)
+    N_NEURONS = len(neurons)
 
-    neuron = np.array(neuron_stims_struct[NEURON_NUMBER], dtype=float).flatten()
+    neuron = np.array(neurons[NEURON_NUMBER], dtype=float).flatten()
 
-    # gen_fig_a(neuron)
+    # gen_M(neurons, dt=0.1) # 0.1 ms
+    # gen_fig_a(neurons)
     # gen_fig_c(neuron, odor_starts, odors)
-    # gen_fig_1f(neuron_stims_struct, odor_starts, odors)
-    plot_corr_pop_vector(neuron_stims_struct, odor_starts, odors)
-
+    # gen_fig_1f(neurons, odor_starts, odors)
+    # plot_corr_pop_vector(neurons, odor_starts, odors)
+    trial_zscores(neurons, odor_starts, odors)
 
 
 if __name__ == "__main__":
