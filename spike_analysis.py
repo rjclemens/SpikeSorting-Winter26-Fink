@@ -4,6 +4,8 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 from scipy.io import loadmat
 from scipy.sparse import lil_matrix, csr_matrix
+from scipy.stats import mannwhitneyu, ks_2samp, ttest_ind
+from itertools import combinations
 import seaborn as sns
 
 DIR = 'Dataset1'
@@ -321,7 +323,43 @@ def trial_zscores(neurons, odor_starts, odors):
     # plt.show()
     plt.savefig("zscores_by_trial.png", dpi=300, bbox_inches="tight")
 
-    
+
+def delta(neurons, odor_starts, odors, consecutive=False):
+    """
+    Generate delta_ij, the population vector difference between pairs of within-odor trials
+    Determine if odor presentations {1...n_novel} are drawn from different distribution than {n_novel+1...25}
+    """
+    delta_ij = np.zeros((N_ODORS, TRIALS_PER_ODOR, TRIALS_PER_ODOR, N_NEURONS))
+    odor_idxs = np.zeros((N_ODORS, TRIALS_PER_ODOR), dtype=int)
+    spike_counts = gen_spike_counts(neurons, odor_starts, odors, sorted=False, times=[ODOR_START,ODOR_END])
+    odor_presentation_space = np.arange(0, 25)
+    p_vals = np.zeros(TRIALS_PER_ODOR-1)
+
+    for k in range(N_ODORS):
+        odor_idxs[k] = np.where(odors == k+1)[0]
+        ij_pairs = [(int(i), int(j)) for i, j in combinations(odor_idxs[k], 2)]
+        for i,j in ij_pairs:
+            presentation_i = np.where(odor_idxs[k] == i)[0][0]
+            presentation_j = np.where(odor_idxs[k] == j)[0][0]
+            delta_ij[k, presentation_i, presentation_j, :] = spike_counts[:, i] - spike_counts[:, j]
+
+    ij_pairs = [(int(i), int(j)) for i, j in combinations(odor_presentation_space, 2)]
+    for n_novel in range(1, TRIALS_PER_ODOR-1):
+        group_novel, group_familiar = [], []
+        for k in range(N_ODORS):
+            if consecutive: 
+                ij_pairs = np.stack([odor_presentation_space[:-1], odor_presentation_space[1:]], axis=1)
+            for i,j in ij_pairs:
+                if i <= n_novel and j <= n_novel:
+                    group_novel.extend(delta_ij[k, i, j, :])
+                else:
+                    group_familiar.extend(delta_ij[k, i, j, :])
+        
+        p_vals[n_novel] = mannwhitneyu(group_novel, group_familiar, alternative='two-sided')[1]
+        _, kp = ks_2samp(group_novel, group_familiar)
+        _, ttest = ttest_ind(group_novel, group_familiar, equal_var=False)
+        print(f'{n_novel}: novel: {len(group_novel)/1007}, avg: {np.mean(group_novel):.2f}, familiar: {len(group_familiar)/1007}, avg: {np.mean(group_familiar):.2f} p: {p_vals[n_novel]}, ks: {kp}, ttest: {ttest}')
+
 
 
 def main():
@@ -349,7 +387,8 @@ def main():
     # gen_fig_c(neuron, odor_starts, odors)
     # gen_fig_1f(neurons, odor_starts, odors)
     # plot_corr_pop_vector(neurons, odor_starts, odors)
-    trial_zscores(neurons, odor_starts, odors)
+    # trial_zscores(neurons, odor_starts, odors)
+    delta(neurons, odor_starts, odors, consecutive=True)
 
 
 if __name__ == "__main__":
