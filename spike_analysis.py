@@ -325,6 +325,12 @@ def trial_zscores(neurons, odor_starts, odors):
 
 
 def delta(neurons, odor_starts, odors, consecutive=False):
+    # compute p value separately per odor
+    # understand how p value is computed
+    # make histogram of the sets of numbers being used of p values, super impose them
+    # i-j <= number --> sliding window, see if anything is chaning, odor specific trials
+    # test p values with random shuffle and plot that instead (randomly draw pairs of i,j. populate two distributions with random draws)
+    # do that enough times to get a distribution of p values
     """
     Generate delta_ij, the population vector difference between pairs of within-odor trials
     Determine if odor presentations {1...n_novel} are drawn from different distribution than {n_novel+1...25}
@@ -334,6 +340,7 @@ def delta(neurons, odor_starts, odors, consecutive=False):
     spike_counts = gen_spike_counts(neurons, odor_starts, odors, sorted=False, times=[ODOR_START,ODOR_END])
     odor_presentation_space = np.arange(0, 25)
     p_vals = np.zeros(TRIALS_PER_ODOR-1)
+    p_vals_x = np.zeros(TRIALS_PER_ODOR-1)
 
     for k in range(N_ODORS):
         odor_idxs[k] = np.where(odors == k+1)[0]
@@ -346,20 +353,49 @@ def delta(neurons, odor_starts, odors, consecutive=False):
     ij_pairs = [(int(i), int(j)) for i, j in combinations(odor_presentation_space, 2)]
     for n_novel in range(1, TRIALS_PER_ODOR-1):
         group_novel, group_familiar = [], []
+        group_novel_x, group_familiar_x = [], []
         for k in range(N_ODORS):
             if consecutive: 
                 ij_pairs = np.stack([odor_presentation_space[:-1], odor_presentation_space[1:]], axis=1)
             for i,j in ij_pairs:
                 if i <= n_novel and j <= n_novel:
                     group_novel.extend(delta_ij[k, i, j, :])
+                    group_novel_x.extend(spike_counts[:, i])
                 else:
                     group_familiar.extend(delta_ij[k, i, j, :])
+                    group_familiar_x.extend(spike_counts[:, i])
         
         p_vals[n_novel] = mannwhitneyu(group_novel, group_familiar, alternative='two-sided')[1]
+        p_vals_x[n_novel] = mannwhitneyu(group_novel_x, group_familiar_x, alternative='two-sided')[1]
         _, kp = ks_2samp(group_novel, group_familiar)
         _, ttest = ttest_ind(group_novel, group_familiar, equal_var=False)
-        print(f'{n_novel}: novel: {len(group_novel)/1007}, avg: {np.mean(group_novel):.2f}, familiar: {len(group_familiar)/1007}, avg: {np.mean(group_familiar):.2f} p: {p_vals[n_novel]}, ks: {kp}, ttest: {ttest}')
+        print(f'd{n_novel}: novel: {len(group_novel)/1007}, avg: {np.mean(group_novel):.2f}, familiar: {len(group_familiar)/1007}, avg: {np.mean(group_familiar):.2f} p: {p_vals[n_novel]}, ks: {kp}, ttest: {ttest}')
+        print(f'x{n_novel}: novel: {len(group_novel_x)/1007}, avg: {np.mean(group_novel_x):.2f}, familiar: {len(group_familiar_x)/1007}, avg: {np.mean(group_familiar_x):.2f} p: {p_vals_x[n_novel]}')
 
+    # -------------- CONSEC. TRIALS -----------------------
+    delta_ij_con = np.zeros((N_NEURONS, N_TRIALS))
+    p_vals_consec = np.zeros(TRIALS_PER_ODOR-1)
+    for i in range(N_TRIALS-1):
+        delta_ij_con[:, i] = spike_counts[:, i] - spike_counts[:, i+1]   
+    for n_novel in range(1, TRIALS_PER_ODOR-1):
+        group_novel = delta_ij_con[:, :8*n_novel].flatten()
+        group_familiar =  delta_ij_con[:, 8*n_novel:].flatten()
+        p_vals_consec[n_novel] = mannwhitneyu(group_novel, group_familiar, alternative='two-sided')[1]
+        print(f'{n_novel}: novel: {len(group_novel)/1007}, avg: {np.mean(group_novel):.2f}, familiar: {len(group_familiar)/1007}, avg: {np.mean(group_familiar):.2f} p: {p_vals_consec[n_novel]}')
+    
+    n_novel_range = np.arange(0, len(p_vals))
+    plt.figure(figsize=(8,4))
+    plt.plot(n_novel_range, p_vals, marker='o', label='δ Consecutive odor pairs')
+    plt.plot(n_novel_range, p_vals_consec, marker='s', label='δ Consecutive trial pairs')
+    plt.plot(n_novel_range, p_vals_x, marker='x', label='x Consecutive odor pairs')
+    plt.yscale('log')           # optional if p-values span many orders
+    plt.xlabel('Number of novel odors')
+    plt.xlim(1,25)
+    plt.ylabel('p Mann-Whitney')
+    plt.title('Comparison of p-values')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
 
 
 def main():
