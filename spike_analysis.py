@@ -2,14 +2,15 @@ import mat73
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+import random
 from scipy.io import loadmat
 from scipy.sparse import lil_matrix, csr_matrix
 from scipy.stats import mannwhitneyu, ks_2samp, ttest_ind
 from itertools import combinations
 import seaborn as sns
 
-DIR = 'Dataset1'
-FILE_NAME = 'eventTimes.mat' # APCdata.mat, eventTimes.mat
+DIR = 'Dataset3'
+FILE_NAME = 'APCdata.mat' # APCdata.mat, eventTimes.mat
 DATA = f'{DIR}/{FILE_NAME}'
 NEURON_NUMBER = 9
 RECORDING_LENGTH = 25200 # 7h
@@ -325,42 +326,269 @@ def trial_zscores(neurons, odor_starts, odors):
 
 
 def delta(neurons, odor_starts, odors, consecutive=False):
+    # compute p value separately per odor
+    # sliding window-- compare across datasets, is there a sweetspot of trials in window that are important?
+    # what is effect size, what is p value, what is non vs parametric test, why require independent?
+    # ----- for effect size, compare L2 norm of the groups.
+    # plot the groups as histograms, look at heat maps for trials used to compute delta, and the delta itself
+    # can we illuimate the reason why the groups appear to be drawn from different distributions?
+    # look at correlation matrix of delta values -> see high correlation within group1 trials but not between group1 and group2
+    # understand how p value is computed
+    
+    # do same analysis across novel/familiar odors in L1R1 dataset
+
+    # INSTEAD OF PDF, USE CDF
+    # DO SAME FOR ALL RESPONSE VECTORS
+    # can we train classifier to distinguish novel from familiar, given population vector?
+    # i.e. group in "novel" trials, compare to familiar trials, keep one out and predict and record accuracy (so 200 total classifiers)
+    # prove there is something about novelty that is distinct from the rest
+    # can p values be computed per odor?
+    # find nice units for rasters in my own dataset
     """
     Generate delta_ij, the population vector difference between pairs of within-odor trials
     Determine if odor presentations {1...n_novel} are drawn from different distribution than {n_novel+1...25}
     """
+    
+    def sliding_window_mask(len, grp1, grp2, i, j):
+        if j <= n_novel and i >= n_novel-len:
+            grp1.extend(delta_ij[k, i, j, :])
+        else: 
+            grp2.extend(delta_ij[k, i, j, :])
+
+    def sliding_window_james(n_novel, d, grp_novel, grp_fam, ij_pairs, k, group1_rand, group2_rand, n_base=2):
+        ij_pairs_james = [(i, j) for (i, j) in ij_pairs if (j - i) <= d and i > n_base]
+        for (i,j) in ij_pairs_james:
+            i_rand, j_rand = random.choice(ij_pairs_james)
+            if i >= n_base and j <= n_novel:
+                grp_novel.extend(delta_ij[k, i, j, :])
+                group1_rand.extend(delta_ij[k, i_rand, j_rand, :])
+            elif i >= n_novel:
+                grp_fam.extend(delta_ij[k, i, j, :])
+                group2_rand.extend(delta_ij[k, i_rand, j_rand, :])
+        # print(f'n_novel: {n_novel}, novel: {len(grp_novel)/N_NEURONS}, familiar: {len(grp_fam)/N_NEURONS}, rand 1: {len(group1_rand)/N_NEURONS}, rand 2: {len(group2_rand)/N_NEURONS}')
+
     delta_ij = np.zeros((N_ODORS, TRIALS_PER_ODOR, TRIALS_PER_ODOR, N_NEURONS))
     odor_idxs = np.zeros((N_ODORS, TRIALS_PER_ODOR), dtype=int)
     spike_counts = gen_spike_counts(neurons, odor_starts, odors, sorted=False, times=[ODOR_START,ODOR_END])
     odor_presentation_space = np.arange(0, 25)
     p_vals = np.zeros(TRIALS_PER_ODOR-1)
+    p_vals_rand = np.zeros(TRIALS_PER_ODOR-1)
+    p_vals_sliding = np.zeros((TRIALS_PER_ODOR-1, 4))
+
+    delta_mags = np.zeros((TRIALS_PER_ODOR-1, 5))
 
     for k in range(N_ODORS):
         odor_idxs[k] = np.where(odors == k+1)[0]
-        ij_pairs = [(int(i), int(j)) for i, j in combinations(odor_idxs[k], 2)]
-        for i,j in ij_pairs:
+        ij_pairs_ut = [(int(i), int(j)) for i, j in combinations(odor_idxs[k], 2)]
+        for i,j in ij_pairs_ut:
             presentation_i = np.where(odor_idxs[k] == i)[0][0]
             presentation_j = np.where(odor_idxs[k] == j)[0][0]
             delta_ij[k, presentation_i, presentation_j, :] = spike_counts[:, i] - spike_counts[:, j]
 
     ij_pairs = [(int(i), int(j)) for i, j in combinations(odor_presentation_space, 2)]
+    _, axs = plt.subplots(2, 5, figsize=(20, 10))
+
+    
     for n_novel in range(1, TRIALS_PER_ODOR-1):
         group_novel, group_familiar = [], []
+        group_novel_sliding_2, group_familiar_sliding_2 = [], []
+        group_novel_sliding_3, group_familiar_sliding_3 = [], []
+        group_novel_sliding_4, group_familiar_sliding_4 = [], []
+        group1_rand, group2_rand = [], []
+        group_novel_james, group_familiar_james = [], []
         for k in range(N_ODORS):
             if consecutive: 
                 ij_pairs = np.stack([odor_presentation_space[:-1], odor_presentation_space[1:]], axis=1)
             for i,j in ij_pairs:
-                if i <= n_novel and j <= n_novel:
-                    group_novel.extend(delta_ij[k, i, j, :])
-                else:
-                    group_familiar.extend(delta_ij[k, i, j, :])
-        
+                i_rand, j_rand = random.choice(ij_pairs)
+                g, g_rand = (group_novel, group1_rand) if j <= n_novel else (group_familiar, group2_rand)                 
+                g.extend(delta_ij[k, i, j, :])
+                # g_rand.extend(delta_ij[k, i_rand, j_rand, :])
+
+                sliding_window_mask(2, group_novel_sliding_2, group_familiar_sliding_2, i, j)
+                sliding_window_mask(3, group_novel_sliding_3, group_familiar_sliding_3, i, j)
+                sliding_window_mask(4, group_novel_sliding_4, group_familiar_sliding_4, i, j)
+            
+            n_base = 2
+            sliding_window_james(n_novel, 4, group_novel_james, group_familiar_james, ij_pairs, k, group1_rand, group2_rand, n_base)
+
         p_vals[n_novel] = mannwhitneyu(group_novel, group_familiar, alternative='two-sided')[1]
-        _, kp = ks_2samp(group_novel, group_familiar)
-        _, ttest = ttest_ind(group_novel, group_familiar, equal_var=False)
-        print(f'{n_novel}: novel: {len(group_novel)/1007}, avg: {np.mean(group_novel):.2f}, familiar: {len(group_familiar)/1007}, avg: {np.mean(group_familiar):.2f} p: {p_vals[n_novel]}, ks: {kp}, ttest: {ttest}')
+        if n_novel > n_base + 1:
+            p_vals_rand[n_novel] = mannwhitneyu(group1_rand, group2_rand, alternative='two-sided')[1]
+        p_vals_sliding[n_novel, 0] = mannwhitneyu(group_novel_sliding_2, group_familiar_sliding_2, alternative='two-sided')[1]
+        p_vals_sliding[n_novel, 1] = mannwhitneyu(group_novel_sliding_3, group_familiar_sliding_3, alternative='two-sided')[1]
+        p_vals_sliding[n_novel, 2] = mannwhitneyu(group_novel_sliding_4, group_familiar_sliding_4, alternative='two-sided')[1]
+        if n_novel > n_base + 1:
+            p_vals_sliding[n_novel, 3] = mannwhitneyu(group_novel_james, group_familiar_james, alternative='two-sided')[1]
+
+        for i, arr in enumerate([group_novel, group_novel_sliding_2, group_novel_sliding_3, group_novel_sliding_4, group1_rand]):
+            chunks = [arr[i:i+N_NEURONS] for i in range(0, len(arr), N_NEURONS)]
+            l2_norms = [np.linalg.norm(chunk) for chunk in chunks]
+            average_l2 = np.mean(l2_norms)
+            delta_mags[n_novel, i] = average_l2
+
+        if n_novel == 12 or n_novel == 15:
+            y_axs = 2 if n_novel == 15 else 1
+            bins = 300
+            range_vals = (-50, 50)
+
+            counts_novel, bin_edges = np.histogram(group_novel_james, bins=bins, range=range_vals)
+            counts_familiar, _ = np.histogram(group_familiar_james, bins=bins, range=range_vals)
+            bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+
+            cdf_novel = np.cumsum(counts_novel.astype(float)/counts_novel.sum())
+            cdf_familiar = np.cumsum(counts_familiar.astype(float)/counts_familiar.sum())
+            cdf_diff = cdf_novel - cdf_familiar
+            # cdf_diff_value = np.mean(group_novel_sliding_4) - np.mean(group_familiar_sliding_4)
+            cdf_diff_value = np.trapz(cdf_diff, bin_centers)
+
+            axs[0, y_axs].plot(bin_centers, cdf_novel, label=f'Novel {n_novel}, James')
+            axs[0, y_axs].plot(bin_centers, cdf_familiar, label=f'Familiar {n_novel}, James')
+            axs[0, 3].plot(bin_centers, cdf_diff, label=f'Difference {n_novel}, Sum = {cdf_diff_value:.2f}')
+
+            axs[0, y_axs].legend()
+            axs[0, y_axs].legend()
+            axs[0, 3].legend()
+
+        # print(f'{n_novel}: novel: {len(group_novel)/1007}, avg: {np.mean(group_novel):.2f}, familiar: {len(group_familiar)/1007}, avg: {np.mean(group_familiar):.2f} p: {p_vals[n_novel]}')
+        # print(f'{n_novel}: novel: {len(group1_rand)/1007}, avg: {np.mean(group1_rand):.2f}, familiar: {len(group2_rand)/1007}, avg: {np.mean(group2_rand):.2f} p: {p_vals_rand[n_novel]}')
+        # print(f'{n_novel}: novel: {len(group_novel_sliding_4)/1007}, avg: {np.mean(group_novel_sliding_4):.2f}, familiar: {len(group_familiar_sliding_4)/1007}, avg: {np.mean(group_familiar_sliding_4):.2f} p: {p_vals_sliding[n_novel]}')
+        # print(p_vals_sliding)
+
+    n_novel_range = np.arange(0, len(p_vals))
+
+    # axs[0, 0].plot(n_novel_range, p_vals, marker='o', label='δ Upper Triangular')
+    # axs[0, 0].plot(n_novel_range, p_vals_sliding[:, 0], marker='x', label='δ Sliding window 2')
+    # axs[0, 0].plot(n_novel_range, p_vals_sliding[:, 1], marker='x', label='δ Sliding window 3')
+    # axs[0, 0].plot(n_novel_range, p_vals_sliding[:, 2], marker='x', label='δ Sliding window 4')
+    axs[0, 0].plot(n_novel_range, p_vals_sliding[:, 3], marker='x', label='δ Sliding window James')
+    axs[0, 0].plot(n_novel_range, p_vals_rand, marker='s', label='δ Random')
+    axs[0, 0].set_yscale('log')   
+    axs[0, 0].set_ylim(1e-22, 1) 
+    axs[0, 0].set_xlabel('Number of novel odors')
+    axs[0, 0].set_ylabel('p')
+    axs[0, 0].set_title(f'Mann-Whitney: {DIR}')
+    axs[0, 0].legend(fontsize=8)
+    axs[0, 0].grid(True)
+
+    axs[0, 4].plot(n_novel_range, delta_mags[:, 0], marker='o', label='δ Upper Triangular')
+    axs[0, 4].plot(n_novel_range, delta_mags[:, 1], marker='x', label='δ Sliding window 2')
+    axs[0, 4].plot(n_novel_range, delta_mags[:, 2], marker='x', label='δ Sliding window 3')
+    axs[0, 4].plot(n_novel_range, delta_mags[:, 3], marker='x', label='δ Sliding window 4')
+    axs[0, 4].plot(n_novel_range, delta_mags[:, 4], marker='s', label='δ Random')
+    axs[0, 4].set_xlabel('Number of novel odors')
+    axs[0, 4].set_ylabel('|δ|₂')
+    axs[0, 4].legend()
+
+    plt.show()
+    return axs
 
 
+def x(neurons, odor_starts, odors, axs):
+    """
+    Determine if odor presentations {1...n_novel} are drawn from different distribution than {n_novel+1...25}
+    For population vectors x
+    """
+    
+    def sliding_window_mask(len, grp1, grp2, i):
+        grp = grp1 if i >= n_novel-len and i <= n_novel else grp2
+        grp.extend(x[k, i, :])
+
+    spike_counts = gen_spike_counts(neurons, odor_starts, odors, sorted=True, times=[ODOR_START,ODOR_END])
+    p_vals = np.zeros(TRIALS_PER_ODOR-1)
+    p_vals_rand = np.zeros(TRIALS_PER_ODOR-1)
+    p_vals_sliding = np.zeros((TRIALS_PER_ODOR-1, 3))
+
+    # spike_counts.shape = (N_NEURONS, N_TRIALS)
+    x = np.zeros((N_ODORS, TRIALS_PER_ODOR, N_NEURONS))
+    x = spike_counts.reshape(N_NEURONS, N_ODORS, TRIALS_PER_ODOR).transpose(1, 2, 0)
+    # for i in range(N_ODORS):
+    #     for j in range(TRIALS_PER_ODOR):
+    #         assert x[i, j, :].all() == spike_counts[:, i*TRIALS_PER_ODOR + j].all()
+
+    x_mags = np.zeros((TRIALS_PER_ODOR-1, 5))
+
+    
+    for n_novel in range(1, TRIALS_PER_ODOR-1):
+        group_novel, group_familiar = [], []
+        group_novel_sliding_2, group_familiar_sliding_2 = [], []
+        group_novel_sliding_3, group_familiar_sliding_3 = [], []
+        group_novel_sliding_4, group_familiar_sliding_4 = [], []
+        group1_rand, group2_rand = [], []
+        for k in range(N_ODORS):
+            for i in range(TRIALS_PER_ODOR):
+                g, g_rand = (group_novel, group1_rand) if i <= n_novel else (group_familiar, group2_rand)
+                g.extend(x[k, i, :])
+                g_rand.extend(x[k, np.random.choice(25), :])
+
+                sliding_window_mask(2, group_novel_sliding_2, group_familiar_sliding_2, i)
+                sliding_window_mask(3, group_novel_sliding_3, group_familiar_sliding_3, i)
+                sliding_window_mask(4, group_novel_sliding_4, group_familiar_sliding_4, i)
+
+        p_vals[n_novel] = mannwhitneyu(group_novel, group_familiar, alternative='two-sided')[1]
+        p_vals_rand[n_novel] = mannwhitneyu(group1_rand, group2_rand, alternative='two-sided')[1]
+        p_vals_sliding[n_novel, 0] = mannwhitneyu(group_novel_sliding_2, group_familiar_sliding_2, alternative='two-sided')[1]
+        p_vals_sliding[n_novel, 1] = mannwhitneyu(group_novel_sliding_3, group_familiar_sliding_3, alternative='two-sided')[1]
+        p_vals_sliding[n_novel, 2] = mannwhitneyu(group_novel_sliding_4, group_familiar_sliding_4, alternative='two-sided')[1]
+
+        for i, arr in enumerate([group_novel, group_novel_sliding_2, group_novel_sliding_3, group_novel_sliding_4, group1_rand]):
+            chunks = [arr[i:i+N_NEURONS] for i in range(0, len(arr), N_NEURONS)]
+            l2_norms = [np.linalg.norm(chunk) for chunk in chunks]
+            average_l2 = np.mean(l2_norms)
+            x_mags[n_novel, i] = average_l2
+
+        if n_novel == 5 or n_novel == 18:
+            y_axs = 2 if n_novel == 18 else 1
+            bins = 300
+            range_vals = (-50, 50)
+
+            counts_novel, bin_edges = np.histogram(group_novel, bins=bins, range=range_vals)
+            counts_familiar, _ = np.histogram(group_familiar, bins=bins, range=range_vals)
+            bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+
+            cdf_novel = np.cumsum(counts_novel.astype(float)/counts_novel.sum())
+            cdf_familiar = np.cumsum(counts_familiar.astype(float)/counts_familiar.sum())
+            cdf_diff = cdf_novel - cdf_familiar
+            # cdf_diff_value = np.mean(group_novel_sliding_3) - np.mean(group_familiar_sliding_3)
+            cdf_diff_value = np.trapz(cdf_diff, bin_centers)
+
+            axs[1, y_axs].plot(bin_centers, cdf_novel, label=f'Novel {n_novel}, UT')
+            axs[1, y_axs].plot(bin_centers, cdf_familiar, label=f'Familiar {n_novel}, UT')
+            axs[1, 3].plot(bin_centers, cdf_diff, label=f'Difference {n_novel}, Sum = {cdf_diff_value:.2f}')
+            
+            axs[1, y_axs].legend()
+            axs[1, y_axs].legend()
+            axs[1, 3].legend()
+
+        # print(f'{n_novel}: novel: {len(group_novel)/1007}, avg: {np.mean(group_novel):.2f}, familiar: {len(group_familiar)/1007}, avg: {np.mean(group_familiar):.2f} p: {p_vals[n_novel]}')
+        # print(f'{n_novel}: novel: {len(group1_rand)/1007}, avg: {np.mean(group1_rand):.2f}, familiar: {len(group2_rand)/1007}, avg: {np.mean(group2_rand):.2f} p: {p_vals_rand[n_novel]}')
+        # print(f'{n_novel}: novel: {len(group_novel_sliding_4)/1007}, avg: {np.mean(group_novel_sliding_4):.2f}, familiar: {len(group_familiar_sliding_4)/1007}, avg: {np.mean(group_familiar_sliding_4):.2f} p: {p_vals_sliding[n_novel]}')
+        # print(p_vals_sliding)
+
+    n_novel_range = np.arange(0, len(p_vals))
+
+    axs[1, 0].plot(n_novel_range, p_vals, marker='o', label='X Upper Triangular')
+    axs[1, 0].plot(n_novel_range, p_vals_sliding[:, 0], marker='x', label='X Sliding window 2')
+    axs[1, 0].plot(n_novel_range, p_vals_sliding[:, 1], marker='x', label='X Sliding window 3')
+    axs[1, 0].plot(n_novel_range, p_vals_sliding[:, 2], marker='x', label='X Sliding window 4')
+    axs[1, 0].plot(n_novel_range, p_vals_rand, marker='s', label='X Random')
+    axs[1, 0].set_yscale('log')    
+    axs[1, 0].set_xlabel('Number of novel odors')
+    axs[1, 0].set_ylabel('p')
+    axs[1, 0].set_title(f'Mann-Whitney: {DIR}')
+    axs[1, 0].legend(fontsize=8)
+    axs[1, 0].grid(True)
+
+    axs[1, 4].plot(n_novel_range, x_mags[:, 0], marker='o', label='X Upper Triangular')
+    axs[1, 4].plot(n_novel_range, x_mags[:, 1], marker='x', label='x Sliding window 2')
+    axs[1, 4].plot(n_novel_range, x_mags[:, 2], marker='x', label='X Sliding window 3')
+    axs[1, 4].plot(n_novel_range, x_mags[:, 3], marker='x', label='X Sliding window 4')
+    axs[1, 4].plot(n_novel_range, x_mags[:, 4], marker='s', label='X Random')
+    axs[1, 4].set_xlabel('Number of novel odors')
+    axs[1, 4].set_ylabel('|X|₂')
+    axs[1, 4].legend()
+
+    plt.show()
 
 def main():
     global N_NEURONS
@@ -388,7 +616,8 @@ def main():
     # gen_fig_1f(neurons, odor_starts, odors)
     # plot_corr_pop_vector(neurons, odor_starts, odors)
     # trial_zscores(neurons, odor_starts, odors)
-    delta(neurons, odor_starts, odors, consecutive=True)
+    axs = delta(neurons, odor_starts, odors)
+    # x(neurons, odor_starts, odors, axs)
 
 
 if __name__ == "__main__":
