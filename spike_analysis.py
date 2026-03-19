@@ -8,6 +8,7 @@ from scipy.sparse import lil_matrix, csr_matrix
 from scipy.stats import mannwhitneyu
 from itertools import combinations
 import seaborn as sns
+import operator
 
 from sklearn.svm import SVC
 from sklearn.decomposition import PCA
@@ -19,7 +20,7 @@ from sklearn.preprocessing import StandardScaler
 DIR = 'Dataset1' # DatasetRaleigh
 FILE_NAME = 'eventTimes.mat' # APCdata.mat, eventTimes.mat
 DATA = f'{DIR}/{FILE_NAME}'
-NEURON_NUMBER = 9
+NEURON_NUMBER = 3
 RECORDING_LENGTH = 25200 # 7h
 
 N_TRIALS = 200
@@ -27,7 +28,7 @@ N_ODORS = 8
 TRIALS_PER_ODOR = int(N_TRIALS / N_ODORS)
 
 N_ZSCORES = 504
-N_BINS = 20
+N_BINS = 120
 
 START = -2
 ODOR_START = 0
@@ -65,30 +66,42 @@ def gen_M(neurons, dt):
     M = M.tocsr().todense()
     return M
 
-def gen_ccgs(neurons, lags, dt):
-    """
-    Generate all CCGs for spike matrix M with dimensions N x T (neurons x times)
-    """
-    M = gen_M(neurons, dt)
-
 
 # limit pairwise conversions 
 # ASK SAM how to compute auto correlogram, Andrew seems to remember he has some clever way of doing it
-def gen_fig_a(neuron):
+def gen_fig_a(neuron, tmin=-20, tmax=20, bin_width=0.1):
     # Computes pairwise intervals between stims
 
-    n = len(neuron)
-    i, j = np.triu_indices(n, k=1) # upper triangle indices (i < j)
-    diffs = np.abs(neuron[i] - neuron[j])
+    n_spikes = len(neuron)
 
-    plt.figure(figsize=(10, 6))
-    plt.hist(diffs, bins=500, edgecolor='black', alpha=0.7)
+    # Create bins
+    edges = np.arange(tmin, tmax + bin_width, bin_width)
+    n_bins = len(edges) - 1
+    counts = np.zeros(n_bins, dtype=int)
 
-    plt.title('Histogram of All Pairwise Differences')
-    plt.xlabel('Pairwise Difference (a - b)')
-    plt.ylabel('Count')
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
+    # Loop over each spike
+    for k in range(n_spikes):
+        # distances to all other spikes
+        d = neuron - neuron[k]
+
+        # Exclude self
+        d = np.delete(d, k)
+
+        # Loop over bins
+        for i in range(n_bins):
+            left = edges[i]
+            right = edges[i + 1]
+            # Count distances within this bin
+            counts[i] += np.sum((d >= left) & (d < right))
+
+    # Bin centers
+    bin_centers = edges[:-1] + bin_width / 2
+    plt.figure(figsize=(8,4))
+    plt.bar(bin_centers, counts, width=0.5, color='gray', edgecolor='black')
+    plt.xlabel("Lag (s)")
+    plt.ylabel("Counts")
+    plt.title("Autocorrelogram")
+    plt.xlim([tmin, tmax])
     plt.show()
 
 def trial_odor_pairs(neuron, odor_starts, start, end, sorted=False, sorted_odor_ind=None):
@@ -164,7 +177,7 @@ def gen_fig_1f(neurons, odor_starts, odors):
     z_scores = np.zeros((N_ZSCORES, N_BINS-1), dtype=float)
 
     for i in range(N_ZSCORES // N_ODORS):
-        neuron = np.array(neurons[i], dtype=float).flatten()
+        neuron = np.array(neurons[i+200], dtype=float).flatten()
         sorted_odor_ind = np.argsort(odors, kind='stable')
         odors = odors[sorted_odor_ind]
         trials = trial_odor_pairs(neuron, odor_starts, START, END, sorted=True, sorted_odor_ind=sorted_odor_ind)
@@ -184,7 +197,7 @@ def gen_fig_1f(neurons, odor_starts, odors):
     tick_positions = (times - START) / (END - START) * (N_BINS - 1)
 
     plt.figure(figsize=(5, 8))
-    plt.style.use('seaborn-talk')
+    plt.style.use('seaborn-v0_8-talk')
     ax = sns.heatmap(z_scores, cmap='RdBu_r', center=0, 
                 vmin=-3, vmax=3,
                 cbar_kws={'label': 'Z-score'})
@@ -280,30 +293,55 @@ def plot_corr_pop_vector(neurons, odor_starts, odors):
 
     # corr_L1 = corr_L1[:25, :25]
     # corr_L2 = corr_L2[:25, :25]
-    # p_corr = p_corr[:25, :25]
+    p_corr = p_corr[:25, :25]
+    # o2 = p_corr_sorted[:]
 
     fig, axs = plt.subplots(1, 5, figsize=(20, 5))
+    plt.subplots_adjust(wspace=0.3)
     fig.suptitle(f"{DIR} Sorted by Trial Number")
 
-    corr_img = axs[0].imshow(corr_L1)
-    fig.colorbar(corr_img, ax=axs[0])
-    axs[0].set_title("L1 Corr")
+    # corr_img = axs[0].imshow(corr_L1)
+    # fig.colorbar(corr_img, ax=axs[0])
+    # axs[0].set_title("L1 Corr")
 
-    corr_img1 = axs[1].imshow(corr_L2, vmin=0.85, vmax=1)
-    fig.colorbar(corr_img1, ax=axs[1])
-    axs[1].set_title("L2 Corr")
+    corr_img1 = axs[1].imshow(p_corr_sorted, vmin=0.75, vmax=1)
+    # fig.colorbar(corr_img1, ax=axs[1])
+    odor_labels = [f'O{i}' for i in range(1, 9)]
+    block_size = 25
+    tick_positions = np.arange(block_size/2, 200, block_size)
+    axs[1].set_xticks(tick_positions)
+    axs[1].set_yticks(tick_positions)
+    axs[1].set_xticklabels(odor_labels)
+    axs[1].set_yticklabels(odor_labels)
+    axs[1].set_title("Pear Corr by Odor")
 
-    corr_img2 = axs[2].imshow(p_corr)
-    fig.colorbar(corr_img2, ax=axs[2])
-    axs[2].set_title("Pearson's Corr")
+    corr_img2 = axs[2].imshow(p_corr, vmin=0.75, vmax=1)
+    # fig.colorbar(corr_img2, ax=axs[2])
+    axs[2].set_title("Pearson's Corr by Trial")
+
+    # O2 (x), O3 (y)
+    block_O2O3 = p_corr_sorted[50:75, 25:50]
+    axs[3].imshow(block_O2O3, vmin=0.75, vmax=1)
+    axs[3].set_xlabel("O2")
+    axs[3].set_ylabel("O3")
+    axs[3].set_xticks([])
+    axs[3].set_yticks([])
+
+    # O3 (x), O3 (y)
+    block_O3O3 = p_corr_sorted[50:75, 50:75]
+    axs[4].imshow(block_O3O3, vmin=0.75, vmax=1)
+    axs[4].set_xlabel("O3")
+    axs[4].set_ylabel("O3")
+    axs[4].set_xticks([])
+    axs[4].set_yticks([])
 
     # corr_img3 = axs[3].imshow(p_corr_shuffle)
     # fig.colorbar(corr_img3, ax=axs[3])
     # axs[3].set_title("Pearson's Corr Random Shuffle")
 
-    axs[4].plot(p_corr_avgs)
-    axs[4].set_xlabel("Trial Pair Corrs (1 --> pcorr(x1, x2))")
-    axs[4].set_title("Pearson's Corr Between Consecutive Trials")
+    # axs[4].plot(p_corr_avgs)
+    # axs[4].set_xlabel("Trial Pair Corrs (1 --> pcorr(x1, x2))")
+    # axs[4].set_title("Pearson's Corr Between Consecutive Trials")
 
     # axs[2].plot(corrs_by_odor.T)
     # axs[2].plot(corrs_by_odor)
@@ -347,17 +385,30 @@ def trial_zscores(neurons, odor_starts, odors):
 
     _, axs = plt.subplots(1, 5, figsize=(20, 7))
     axs = axs.flatten()
-    for i, trial in enumerate([0, 49, 99, 149, 199]):
+    times = np.array([-2, 0, 4, 10])
+    tick_positions = (times - START) / (END - START) * (N_BINS - 1)
+
+    ODOR = 3
+    trial_idxs = np.where(odors == ODOR)[0] 
+    selected_trials = np.linspace(0, len(trial_idxs)-1, 5, dtype=int) 
+
+    for i, trial in enumerate(trial_idxs[selected_trials]):
         sns.heatmap(z_scores[:, :, trial],ax=axs[i],cmap='RdBu_r',
         center=0,vmin=-2,vmax=2, cbar=False)
-        axs[i].set_title(f'Trial {trial+1}')
 
+        axs[i].set_title(f'Odor {ODOR}, Presentation {selected_trials[i]+1}\nTrial {trial+1}')
+        axs[i].set_xticks(tick_positions)
+        axs[i].set_xticklabels(times, rotation=0)
+        axs[i].axvline(x=tick_positions[1], color='k', linestyle='--', label='Odor Start')
+        axs[i].axvline(x=tick_positions[2], color='red', linestyle='--', label='Odor End')
+        # axs[i].axvspan(ODOR_START, ODOR_END, color='yellow', alpha=0.2)
+        axs[i].set_xlabel('Time (s)')
     plt.tight_layout()
     plt.show()
     # plt.savefig("zscores_by_trial.png", dpi=300, bbox_inches="tight")
 
 
-def delta(neurons, odor_starts, odors, consecutive=False):
+def delta(neurons, odor_starts, odors, op, consecutive=False):
     # compute p value separately per odor
     # sliding window-- compare across datasets, is there a sweetspot of trials in window that are important?
     # what is effect size, what is p value, what is non vs parametric test, why require independent?
@@ -414,10 +465,12 @@ def delta(neurons, odor_starts, odors, consecutive=False):
         for i,j in ij_pairs_ut:
             presentation_i = np.where(odor_idxs[k] == i)[0][0]
             presentation_j = np.where(odor_idxs[k] == j)[0][0]
-            delta_ij[k, presentation_i, presentation_j, :] = spike_counts[:, i] - spike_counts[:, j]
+            delta_ij[k, presentation_i, presentation_j, :] = op(spike_counts[:, i], spike_counts[:, j])
 
     ij_pairs = [(int(i), int(j)) for i, j in combinations(ODOR_PRESENTATION_SPACE, 2)]
     _, axs = plt.subplots(2, 5, figsize=(20, 10))
+    plt.subplots_adjust(wspace=0.35)
+    symbol = '*' if op == operator.mul else 'Δ'
 
     
     for n_novel in range(1, TRIALS_PER_ODOR-1):
@@ -437,9 +490,9 @@ def delta(neurons, odor_starts, odors, consecutive=False):
                 g.extend(delta_ij[k, i, j, :])
                 # g_rand.extend(delta_ij[k, i_rand, j_rand, :])
 
-                sliding_window_mask(2, group_novel_sliding_2, group_familiar_sliding_2, i, j)
-                sliding_window_mask(3, group_novel_sliding_3, group_familiar_sliding_3, i, j)
-                sliding_window_mask(4, group_novel_sliding_4, group_familiar_sliding_4, i, j)
+                # sliding_window_mask(2, group_novel_sliding_2, group_familiar_sliding_2, i, j)
+                # sliding_window_mask(3, group_novel_sliding_3, group_familiar_sliding_3, i, j)
+                # sliding_window_mask(4, group_novel_sliding_4, group_familiar_sliding_4, i, j)
             
             n_base = 2
             sliding_window_james(n_novel, 4, group_novel_james_4, group_familiar_james_4, ij_pairs, k, group1_rand, group2_rand, n_base)
@@ -448,21 +501,22 @@ def delta(neurons, odor_starts, odors, consecutive=False):
         p_vals[n_novel] = mannwhitneyu(group_novel, group_familiar, alternative='two-sided')[1]
         if n_novel > n_base + 1:
             p_vals_rand[n_novel] = mannwhitneyu(group1_rand, group2_rand, alternative='two-sided')[1]
-        p_vals_sliding[n_novel, 0] = mannwhitneyu(group_novel_sliding_2, group_familiar_sliding_2, alternative='two-sided')[1]
-        p_vals_sliding[n_novel, 1] = mannwhitneyu(group_novel_sliding_3, group_familiar_sliding_3, alternative='two-sided')[1]
-        p_vals_sliding[n_novel, 2] = mannwhitneyu(group_novel_sliding_4, group_familiar_sliding_4, alternative='two-sided')[1]
+        # p_vals_sliding[n_novel, 0] = mannwhitneyu(group_novel_sliding_2, group_familiar_sliding_2, alternative='two-sided')[1]
+        # p_vals_sliding[n_novel, 1] = mannwhitneyu(group_novel_sliding_3, group_familiar_sliding_3, alternative='two-sided')[1]
+        # p_vals_sliding[n_novel, 2] = mannwhitneyu(group_novel_sliding_4, group_familiar_sliding_4, alternative='two-sided')[1]
         if n_novel > n_base + 1:
             p_vals_sliding[n_novel, 3] = mannwhitneyu(group_novel_james_4, group_familiar_james_4, alternative='two-sided')[1]
             p_vals_sliding[n_novel, 4] = mannwhitneyu(group_novel_james_6, group_familiar_james_6, alternative='two-sided')[1]
 
-        for i, arr in enumerate([group_novel, group_novel_sliding_2, group_novel_sliding_3, group_novel_sliding_4, group1_rand]):
+        # for i, arr in enumerate([group_novel, group_novel_sliding_2, group_novel_sliding_3, group_novel_sliding_4, group1_rand]):
+        for i, arr in enumerate([group_novel, group_novel_sliding_4, group_novel_james_4, group_novel_james_6, group1_rand]):
             chunks = [arr[i:i+N_NEURONS] for i in range(0, len(arr), N_NEURONS)]
             l2_norms = [np.linalg.norm(chunk) for chunk in chunks]
             average_l2 = np.mean(l2_norms)
             delta_mags[n_novel, i] = average_l2
 
-        if n_novel == 12 or n_novel == 17:
-            y_axs = 2 if n_novel == 17 else 1
+        if n_novel == 9 or n_novel == 18:
+            y_axs = 2 if n_novel == 18 else 1
             bins = 300
             range_vals = (-50, 50)
 
@@ -476,9 +530,10 @@ def delta(neurons, odor_starts, odors, consecutive=False):
             # cdf_diff_value = np.mean(group_novel_sliding_4) - np.mean(group_familiar_sliding_4)
             cdf_diff_value = np.trapz(cdf_diff, bin_centers)
 
-            axs[0, y_axs].plot(bin_centers, cdf_novel, label=f'Novel {n_novel}, James 6')
-            axs[0, y_axs].plot(bin_centers, cdf_familiar, label=f'Familiar {n_novel}, James 6')
-            axs[0, 3].plot(bin_centers, cdf_diff, label=f'Difference {n_novel}, Sum = {cdf_diff_value:.2f}')
+            axs[0, y_axs].plot(bin_centers, cdf_novel, label=f'Novel {n_novel}, Sliding Window 6')
+            axs[0, y_axs].plot(bin_centers, cdf_familiar, label=f'Familiar {n_novel}, Sliding Window 6')
+            colors = ['brown', 'green']
+            axs[0, 3].plot(bin_centers, cdf_diff, label=f'Diff {n_novel}, Sum = {cdf_diff_value:.2f}', color=colors[y_axs-1])
 
             axs[0, y_axs].legend()
             axs[0, y_axs].legend()
@@ -491,28 +546,31 @@ def delta(neurons, odor_starts, odors, consecutive=False):
 
     n_novel_range = np.arange(0, len(p_vals))
 
-    # axs[0, 0].plot(n_novel_range, p_vals, marker='o', label='δ Upper Triangular')
+    # axs[0, 0].plot(n_novel_range, p_vals, marker='o', label=f'{symbol} Upper Triangular')
     # axs[0, 0].plot(n_novel_range, p_vals_sliding[:, 0], marker='x', label='δ Sliding window 2')
     # axs[0, 0].plot(n_novel_range, p_vals_sliding[:, 1], marker='x', label='δ Sliding window 3')
-    # axs[0, 0].plot(n_novel_range, p_vals_sliding[:, 2], marker='x', label='δ Sliding window 4')
-    axs[0, 0].plot(n_novel_range, p_vals_sliding[:, 3], marker='x', label='δ 4 Sliding window James')
-    axs[0, 0].plot(n_novel_range, p_vals_sliding[:, 4], marker='x', label='δ 6 Sliding window James')
-    axs[0, 0].plot(n_novel_range, p_vals_rand, marker='s', label='δ Random')
+    # axs[0, 0].plot(n_novel_range, p_vals_sliding[:, 2], marker='x', label=f'{symbol} 4 Sliding window')
+    axs[0, 0].plot(n_novel_range, p_vals_sliding[:, 3], marker='x', label=f'{symbol}: Sliding Window 4')
+    axs[0, 0].plot(n_novel_range, p_vals_sliding[:, 4], marker='x', label=f'{symbol}: Sliding Window 6')
+    axs[0, 0].plot(n_novel_range, p_vals_rand, marker='s', label=f'Random')
     axs[0, 0].set_yscale('log')   
     # axs[0, 0].set_ylim(1e-22, 1) 
     axs[0, 0].set_xlabel('Number of novel odors')
     axs[0, 0].set_ylabel('p')
     axs[0, 0].set_title(f'Mann-Whitney: {DIR}')
-    axs[0, 0].legend(fontsize=8)
+    # axs[0, 0].legend(loc='upper left', bbox_to_anchor=(1.02, 1), borderaxespad=0, fontsize=8)
+    # axs[0, 0].legend(fontsize=8)
     axs[0, 0].grid(True)
 
-    axs[0, 4].plot(n_novel_range, delta_mags[:, 0], marker='o', label='δ Upper Triangular')
-    axs[0, 4].plot(n_novel_range, delta_mags[:, 1], marker='x', label='δ Sliding window 2')
-    axs[0, 4].plot(n_novel_range, delta_mags[:, 2], marker='x', label='δ Sliding window 3')
-    axs[0, 4].plot(n_novel_range, delta_mags[:, 3], marker='x', label='δ Sliding window 4')
-    axs[0, 4].plot(n_novel_range, delta_mags[:, 4], marker='s', label='δ Random')
+    # axs[0, 4].plot(n_novel_range, delta_mags[:, 0], marker='o', label=f'{symbol} Upper Triangular')
+    # axs[0, 4].plot(n_novel_range, delta_mags[:, 1], marker='x', label='δ Sliding window 2')
+    # axs[0, 4].plot(n_novel_range, delta_mags[:, 2], marker='x', label='δ Sliding window 3')
+    # axs[0, 4].plot(n_novel_range, delta_mags[:, 1], marker='x', label=f'{symbol} 4 Sliding window')
+    axs[0, 4].plot(n_novel_range, delta_mags[:, 2], marker='x', label=f'{symbol}=4 Sliding Window')
+    axs[0, 4].plot(n_novel_range, delta_mags[:, 3], marker='x', label=f'{symbol}=6 Sliding Window')
+    axs[0, 4].plot(n_novel_range, delta_mags[:, 4], marker='s', label=f'Random')
     axs[0, 4].set_xlabel('Number of novel odors')
-    axs[0, 4].set_ylabel('|δ|₂')
+    axs[0, 4].set_ylabel(f'|{symbol}|₂')
     axs[0, 4].legend()
 
     # plt.show()
@@ -544,14 +602,16 @@ def x(neurons, odor_starts, odors, axs):
     x_mags = np.zeros((TRIALS_PER_ODOR-1, 5))
 
     
-    for n_novel in range(1, TRIALS_PER_ODOR-1):
+    for n_novel in range(2, TRIALS_PER_ODOR-1):
         group_novel, group_familiar = [], []
         group_novel_sliding_2, group_familiar_sliding_2 = [], []
         group_novel_sliding_3, group_familiar_sliding_3 = [], []
         group_novel_sliding_4, group_familiar_sliding_4 = [], []
         group1_rand, group2_rand = [], []
+        n_base = 2
         for k in range(N_ODORS):
-            for i in range(TRIALS_PER_ODOR):
+            # James's sliding window for X, cut off first n_base trials and rerun analysis
+            for i in range(n_base, TRIALS_PER_ODOR):
                 g, g_rand = (group_novel, group1_rand) if i <= n_novel else (group_familiar, group2_rand)
                 g.extend(x[k, i, :])
                 g_rand.extend(x[k, np.random.choice(25), :])
@@ -587,9 +647,10 @@ def x(neurons, odor_starts, odors, axs):
             # cdf_diff_value = np.mean(group_novel_sliding_3) - np.mean(group_familiar_sliding_3)
             cdf_diff_value = np.trapz(cdf_diff, bin_centers)
 
-            axs[1, y_axs].plot(bin_centers, cdf_novel, label=f'Novel {n_novel}, UT')
-            axs[1, y_axs].plot(bin_centers, cdf_familiar, label=f'Familiar {n_novel}, UT')
-            axs[1, 3].plot(bin_centers, cdf_diff, label=f'Difference {n_novel}, Sum = {cdf_diff_value:.2f}')
+            axs[1, y_axs].plot(bin_centers, cdf_novel, label=f'Novel {n_novel}, X')
+            axs[1, y_axs].plot(bin_centers, cdf_familiar, label=f'Familiar {n_novel}, X')
+            colors = ['brown', 'green']
+            axs[1, 3].plot(bin_centers, cdf_diff, label=f'Diff {n_novel}, Sum = {cdf_diff_value:.2f}', color=colors[y_axs-1])
             
             axs[1, y_axs].legend()
             axs[1, y_axs].legend()
@@ -602,7 +663,7 @@ def x(neurons, odor_starts, odors, axs):
 
     n_novel_range = np.arange(0, len(p_vals))
 
-    axs[1, 0].plot(n_novel_range, p_vals, marker='o', label='X Upper Triangular')
+    axs[1, 0].plot(n_novel_range, p_vals, marker='o', label='X (n_base = 2)')
     axs[1, 0].plot(n_novel_range, p_vals_sliding[:, 0], marker='x', label='X Sliding window 2')
     axs[1, 0].plot(n_novel_range, p_vals_sliding[:, 1], marker='x', label='X Sliding window 3')
     axs[1, 0].plot(n_novel_range, p_vals_sliding[:, 2], marker='x', label='X Sliding window 4')
@@ -614,8 +675,8 @@ def x(neurons, odor_starts, odors, axs):
     axs[1, 0].legend(fontsize=8)
     axs[1, 0].grid(True)
 
-    axs[1, 4].plot(n_novel_range, x_mags[:, 0], marker='o', label='X Upper Triangular')
-    axs[1, 4].plot(n_novel_range, x_mags[:, 1], marker='x', label='x Sliding window 2')
+    axs[1, 4].plot(n_novel_range, x_mags[:, 0], marker='o', label='X (n_base = 2)')
+    axs[1, 4].plot(n_novel_range, x_mags[:, 1], marker='x', label='X Sliding window 2')
     axs[1, 4].plot(n_novel_range, x_mags[:, 2], marker='x', label='X Sliding window 3')
     axs[1, 4].plot(n_novel_range, x_mags[:, 3], marker='x', label='X Sliding window 4')
     axs[1, 4].plot(n_novel_range, x_mags[:, 4], marker='s', label='X Random')
@@ -660,7 +721,7 @@ def svm(neurons, odor_starts, odors):
         # num_novel_correct, num_familiar_correct = np.sum((predictions == NOVEL) & (truth == NOVEL)), np.sum((predictions == FAMILIAR) & (truth == FAMILIAR))
         # print(f"{n_novel}: Accuracy: {accuracy[n_novel]:.4f}, % novel: {num_novel/N_TRIALS}, % novel correct: {num_novel_correct/num_novel},  % familiar corect; {num_familiar_correct/num_familiar}")
 
-    _, axs = plt.subplots(1, 4, figsize=(20, 5))
+    fig, axs = plt.subplots(1, 4, figsize=(20, 5))
     plt.subplots_adjust(wspace=0.35)
 
     pca_spont = PCA(n_components=2)
@@ -669,18 +730,18 @@ def svm(neurons, odor_starts, odors):
     pca_odor = PCA(n_components=2)
     X_pca = pca_odor.fit_transform(spike_counts)
 
-    spontaneous_variance = pca_spont.explained_variance_ratio_ * 100
-    odor_evoked_variance = pca_odor.explained_variance_ratio_ * 100
+    # spontaneous_variance = pca_spont.explained_variance_ratio_ * 100
+    # odor_evoked_variance = pca_odor.explained_variance_ratio_ * 100
 
-    axs[0].plot(pca_odor.components_[0], label=f'PC1 ({odor_evoked_variance[0]:.1f}%)')
-    axs[0].plot(pca_odor.components_[1], label=f'PC2 ({odor_evoked_variance[1]:.1f}%)')
+    # axs[0].plot(pca_odor.components_[0], label=f'PC1 ({odor_evoked_variance[0]:.1f}%)')
+    # axs[0].plot(pca_odor.components_[1], label=f'PC2 ({odor_evoked_variance[1]:.1f}%)')
 
-    axs[0].plot(pca_spont.components_[0], label=f'Spon. PC1 ({spontaneous_variance[0]:.1f}%)')
-    axs[0].plot(pca_spont.components_[1], label=f'Spon. PC2 ({spontaneous_variance[1]:.1f}%)')
+    # axs[0].plot(pca_spont.components_[0], label=f'Spon. PC1 ({spontaneous_variance[0]:.1f}%)')
+    # axs[0].plot(pca_spont.components_[1], label=f'Spon. PC2 ({spontaneous_variance[1]:.1f}%)')
 
-    axs[0].set_xlabel("Neuron")
-    axs[0].set_ylabel("PC Loading Weight")
-    axs[0].legend()
+    # axs[0].set_xlabel("Neuron")
+    # axs[0].set_ylabel("PC Loading Weight")
+    # axs[0].legend()
     # axs[0].plot(ODOR_PRESENTATION_SPACE, accuracy_linear*100, label='Linear SVM')
     # axs[0].axhline(50, color='red', linestyle='--', label='Baseline')
     # axs[0].set_xlabel('# Novel Presentations')
@@ -691,38 +752,93 @@ def svm(neurons, odor_starts, odors):
     # axs[0].legend()
 
     # SVM visualization
-    for i, n_novel in enumerate([3, 10, 17]):
+    n_novel_axis = np.arange(2, 25, 1)
+    svm_movement = []
+    axis = -1
+
+    X_odor_pca = pca_spont.transform(spike_counts)
+
+    padding_x, padding_y = 70, 0.5
+    x_min, x_max = X_odor_pca[:, 0].min() - padding_x, X_odor_pca[:, 0].max() + padding_x
+    y_min, y_max = X_odor_pca[:, 1].min() - padding_y, X_odor_pca[:, 1].max() + padding_y
+    xx, yy = np.meshgrid(np.linspace(x_min, x_max, 500),
+                        np.linspace(y_min, y_max, 500))
+    
+    for i, n_novel in enumerate(n_novel_axis):
         Y = np.tile(np.r_[np.zeros(n_novel), np.ones(25-n_novel)], TRIALS_PER_ODOR)[:N_TRIALS].astype(int)
-        
+
         # pca = PCA(n_components=2)
         # X_spontaneous_pca = pca.fit_transform(spike_counts_spontaneous)
         # X_2d = StandardScaler().fit_transform(X_spontaneous_pca)
 
         # fit odor evoked activity to spontaneous PCs
-        X_odor_pca_spont = pca_spont.transform(spike_counts_spontaneous)
 
-
-        padding = 0.5
-        x_min, x_max = X_odor_pca_spont[:, 0].min() - padding, X_odor_pca_spont[:, 0].max() + padding
-        y_min, y_max = X_odor_pca_spont[:, 1].min() - padding, X_odor_pca_spont[:, 1].max() + padding
-        xx, yy = np.meshgrid(np.linspace(x_min, x_max, 500),
-                            np.linspace(y_min, y_max, 500))
         
         clf_pca_linear = SVC(kernel='linear', C=0.1)
-        clf_pca_linear.fit(X_odor_pca_spont, Y)
+        clf_pca_linear.fit(X_odor_pca, Y)
         Z_linear = clf_pca_linear.decision_function(np.c_[xx.ravel(), yy.ravel()])
         Z_linear = Z_linear.reshape(xx.shape)
 
-        axs[i+1].contourf(xx, yy, Z_linear, levels=[-np.inf, 0, np.inf], colors=['#AAAAFF', '#FFAAAA'], alpha=0.3)
-        axs[i+1].contour(xx, yy, Z_linear, levels=[0], colors='k', linewidths=2, label=f'Z_min = {Z_linear.min()}, Z_max = {Z_linear.max()}')
-        scatter = axs[i+1].scatter(X_odor_pca_spont[:, 0], X_odor_pca_spont[:, 1], c=Y, cmap='coolwarm', edgecolor='k', s=40)
-        handles, _ = scatter.legend_elements()
-        axs[i+1].legend(handles, ['Novel', 'Familiar'], loc="upper right")
-        axs[i+1].set_title(f"2D Linear SVM, n_novel = {n_novel}\nExplained Variance: {np.sum(pca_spont.explained_variance_ratio_)*100:.1f}%")
-        axs[i+1].set_xlabel("Spontaneous PC 1")
-        axs[i+1].set_ylabel("Spontaneous PC 2")
+        w = clf_pca_linear.coef_[0]
+        b = clf_pca_linear.intercept_[0]
+        center = -b * w / np.dot(w, w)
+        svm_movement.append(center)
+
+        if n_novel in [3, 10, 17]: 
+            # axs[axis+1].contourf(xx, yy, Z_linear, levels=[-np.inf, 0, np.inf], colors=['#AAAAFF', '#FFAAAA'], alpha=0.3)
+            # axs[axis+1].contour(xx, yy, Z_linear, levels=[0], colors='k', linewidths=2, label=f'Z_min = {Z_linear.min()}, Z_max = {Z_linear.max()}')
+            scatter = axs[axis+1].scatter(X_odor_pca[:, 0], X_odor_pca[:, 1], c=Y, cmap='coolwarm', edgecolor='k', s=40)
+            handles, _ = scatter.legend_elements()
+            axs[axis+1].legend(handles, ['Novel', 'Familiar'], loc="upper right")
+            # axs[axis+1].set_title(f"2D Linear SVM, n_novel = {n_novel}\nExplained Variance: {np.sum(pca_spont.explained_variance_ratio_)*100:.1f}%")
+            axs[axis+1].set_title(f"n_novel = {n_novel}\nExplained Variance: {np.sum(pca_spont.explained_variance_ratio_)*100:.1f}%")
+            axs[axis+1].set_xlabel("Spontaneous PC 1")
+            axs[axis+1].set_ylabel("Spontaneous PC 2")
+
+            axis += 1
+
+    svm_movement = np.array(svm_movement)   
+
+
+    spike_counts_unsorted = gen_spike_counts(neurons, odor_starts, odors, sorted=False, times=[ODOR_START,ODOR_END]).T
+    X_odor_pca_unsorted = pca_spont.transform(spike_counts_unsorted)
+    colors = np.arange(X_odor_pca_unsorted.shape[0])
+    scatter = axs[3].scatter(
+        X_odor_pca_unsorted[:, 0],
+        X_odor_pca_unsorted[:, 1],
+        c=colors,
+        cmap='coolwarm',
+        edgecolor='k',
+        s=40
+    )
+    cbar = fig.colorbar(scatter, ax=axs[3])
+    cbar.set_label("Trial Number")
+    # axs[3].scatter(X_odor_pca[:, 0], X_odor_pca[:, 1], color='grey', alpha=0.75, cmap='coolwarm', edgecolor='k', s=40)
+    # axs[3].quiver(
+    #     svm_movement[:-1,0],
+    #     svm_movement[:-1,1],
+    #     np.diff(svm_movement[:,0]),
+    #     np.diff(svm_movement[:,1]),
+    #     angles='xy',
+    #     scale_units='xy',
+    #     scale=1,         
+    #     # width=0.008,
+    #     # headwidth=3,
+    #     # headlength=3,
+    #     color='blue'
+    # )
+    axs[3].set_xlim(x_min, x_max)
+    axs[3].set_ylim(y_min, y_max)
+    axs[3].set_title("Odor-Evoked Population Response")
+    axs[3].set_xlabel("Spontaneous PC 1")
+    axs[3].set_ylabel("Spontaneous PC 2")
     
     plt.show()
+
+
+    # Can we do linear regression across time of these 1007D vectors and does it fit well? Compare to null model 
+    # where time is scrambled (randomly arrange 200 trials), 
+    # generate distribution with 100 random attempts and see how much bigger is your r?
 
 
 def odor_trial_split(neurons, odor_starts, odors):
@@ -800,7 +916,7 @@ def odor_trial_split(neurons, odor_starts, odors):
 
 def mean_pop_firing_rate(neurons, odor_starts, odors):
     spike_counts = gen_spike_counts(neurons, odor_starts, odors, sorted=True, times=[ODOR_START,ODOR_END])
-    X = spike_counts.reshape(1007, 8, 25)
+    X = spike_counts.reshape(1007, 8, 25)/(ODOR_END - ODOR_START)
 
     mean = X.mean(axis=(0,1))
     std  = X.std(axis=(0,1))
@@ -808,7 +924,7 @@ def mean_pop_firing_rate(neurons, odor_starts, odors):
     plt.errorbar(range(1,26), mean, yerr=std, fmt='o')
     plt.style.use('seaborn-v0_8-talk')
     plt.xlabel("# of Odor Presentations")
-    plt.ylabel("Firing Rate")
+    plt.ylabel("Firing Rate (Hz)")
     plt.title(f"{DIR}: Mean Odor Evoked Response Firing Rate")
     plt.show()
 
@@ -837,14 +953,14 @@ def main():
     neuron = np.array(neurons[NEURON_NUMBER], dtype=float).flatten()
 
     # gen_M(neurons, dt=0.1) # 0.1 ms
-    # gen_fig_a(neurons)
+    # gen_fig_a(neuron, tmax=20)
     # gen_fig_c(neurons, odor_starts, odors)
     # gen_fig_1f(neurons, odor_starts, odors)
-    plot_corr_pop_vector(neurons, odor_starts, odors)
+    # plot_corr_pop_vector(neurons, odor_starts, odors)
     # trial_zscores(neurons, odor_starts, odors)
-    # axs = delta(neurons, odor_starts, odors)
+    # axs = delta(neurons, odor_starts, odors, operator.mul)
     # x(neurons, odor_starts, odors, axs)
-    # svm(neurons, odor_starts, odors)
+    svm(neurons, odor_starts, odors)
     # odor_trial_split(neurons, odor_starts, odors)
     # mean_pop_firing_rate(neurons, odor_starts, odors)
     
