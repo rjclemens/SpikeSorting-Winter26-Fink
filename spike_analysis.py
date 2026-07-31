@@ -3,9 +3,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import random
+from matplotlib.colors import BoundaryNorm
 from scipy.io import loadmat
 from scipy.sparse import lil_matrix, csr_matrix
+from scipy import stats
 from scipy.stats import mannwhitneyu
+from statsmodels.stats.multitest import multipletests
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import squareform
 from itertools import combinations
 import seaborn as sns
 import operator
@@ -16,6 +21,7 @@ from sklearn.model_selection import LeaveOneOut
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score
 from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LinearRegression
 
 DIR = 'Dataset1' # DatasetRaleigh
 FILE_NAME = 'eventTimes.mat' # APCdata.mat, eventTimes.mat
@@ -33,7 +39,13 @@ N_BINS = 120
 START = -2
 ODOR_START = 0
 ODOR_END = 4
+SPON_START = -5
+SPON_END = -1
 END = 10  
+
+NUM_PRE_POST = 30
+DURATION_PRE_POST = 4
+INTERVAL_PRE_POST = 60
 
 BIN_WIDTH = (END - START) / N_BINS
 LAST_BIN_BEFORE_ODOR = int(-START / BIN_WIDTH)
@@ -50,6 +62,8 @@ COLORS = [
     '#e377c2',  # pink
     '#7f7f7f'   # gray
 ]
+
+CMAP_CLUSTER = 'tab20'
 
 def gen_M(neurons, dt):
     ### M generation takes long time, even with dt=0.1 s...
@@ -235,6 +249,41 @@ def gen_spike_counts(neurons, odor_starts, odors, sorted=True, return_odors=Fals
     
     return (spike_counts, odors) if return_odors else spike_counts
 
+def gen_time_pairs_outside_trials(t_start, num_pairs, duration, interval):
+    """
+    Generate num pairs of times (t1, t2) (t3, t4) ... such that
+    1. duration = t2 - t1
+    2. interval = t1 - t3
+    3. t1 = odor_start - interval
+    4. reverse so lowest time pair is first
+    """
+    pairs = []
+    t1 = t_start - interval
+    for i in range(num_pairs):
+        start = t1 - i * interval
+        end = start + duration
+        if start < 0:
+            break
+        pairs.append((start, end))
+    return sorted(pairs, key=lambda x: x[0])
+
+def gen_spike_counts_outside_trials(neurons, t_start, num_pairs, duration, interval):
+    """
+    pre-odor: t_start = odor_starts[0], interval > 0
+    post-odor: t_start = odor_starts[-1], interval < 0
+    """
+    spike_counts = np.zeros((N_NEURONS, num_pairs))
+    time_pairs = gen_time_pairs_outside_trials(t_start, num_pairs, duration, interval)
+
+    for i in range(N_NEURONS):
+        neuron = np.array(neurons[i], dtype=float).flatten()
+        for j, (t1, t2) in enumerate(time_pairs):
+            cond = (neuron > t1) & (neuron < t2)
+            spike_counts[i, j] = np.sum(neuron[cond])
+
+    return spike_counts
+        
+
 def population_vector_corrs(neurons, odor_starts, odors):
     """
     Generate L1/L2 corrs, Pearson's corr
@@ -287,13 +336,166 @@ def corr_novel_familiar(neurons, odor_starts, odors, p_corr_sorted):
     
     return p_corr_avgs
 
+def population_pcorr(neurons, odor_starts, odors, times):
+    spike_counts = gen_spike_counts(neurons, odor_starts, odors, sorted=False, times=times)
+    p_corr = np.corrcoef(spike_counts, rowvar=False)
+
+    return p_corr
+
+def pcorr_pre_post_plotter(neurons, odor_starts, odors):
+    fig, axs = plt.subplots(1, 1, figsize=(10, 10))
+    spike_counts = gen_spike_counts(neurons, odor_starts, odors, sorted=False, times=[ODOR_START, ODOR_END])
+    spike_counts_pre_odor = gen_spike_counts_outside_trials(neurons, odor_starts[0], NUM_PRE_POST, DURATION_PRE_POST, INTERVAL_PRE_POST)
+    spike_counts_post_odor = gen_spike_counts_outside_trials(neurons, odor_starts[-1], NUM_PRE_POST, DURATION_PRE_POST, -INTERVAL_PRE_POST)
+
+    # 1007 x 260
+    spikes_pre_post = np.concatenate([spike_counts_pre_odor, spike_counts, spike_counts_post_odor], axis=1)
+    p_corr = np.corrcoef(spikes_pre_post, rowvar=False)
+
+    axs.imshow(p_corr, vmin=0.75, vmax=1)
+    axs.set_xticks([])
+    axs.set_yticks([0, 30, 230])
+    axs.set_title('Pre, During, Post Odor PCorr')
+
+    axs.axhline(NUM_PRE_POST, color='r', lw=1)
+    axs.axvline(NUM_PRE_POST, color='r', lw=1)
+    axs.axhline(N_TRIALS + NUM_PRE_POST, color='r', lw=1)
+    axs.axvline(N_TRIALS + NUM_PRE_POST, color='r', lw=1)
+
+    pre_mid = NUM_PRE_POST / 2
+    odor_mid = NUM_PRE_POST + N_TRIALS / 2
+    post_mid = N_TRIALS + NUM_PRE_POST + NUM_PRE_POST / 2
+
+    # x-axis labels (below the plot)
+    for x, label in zip([pre_mid, odor_mid, post_mid], ['Pre-odor', 'Odor', 'Post-odor']):
+        axs.text(x, -0.02, label, ha='center', va='top',
+                transform=axs.get_xaxis_transform(), fontsize=11, fontweight='bold')
+
+    plt.show()
+
+    
+
+def cluster_corr_matrix(p_corr, k, method='average'):
+    """
+    corr_matrix: (n_trials, n_trials) correlation matrix
+    odor_labels: (n_trials,) array/list of odor identity per trial
+    k: number of clusters
+    """
+
+    # clean up rounding errors
+    dist = 1 - p_corr
+    dist = (dist + dist.T) / 2
+    np.fill_diagonal(dist, 0)
+
+    condensed = squareform(dist, checks=False)
+    Z = linkage(condensed, method=method)
+    cluster_ids = fcluster(Z, t=k, criterion='maxclust')
+
+    order = np.argsort(cluster_ids)
+    sorted_cluster_corr = p_corr[order][:, order]
+    sorted_clusters = cluster_ids[order]
+
+    return cluster_ids, sorted_cluster_corr, sorted_clusters
+
+def cluster_pcorr_plotter(p_corr, odors, ax1, ax2, k):
+    CLUSTER5_MAPPING = {5: 4, 8: 5, 12: 7}
+
+    cluster_ids, sorted_cluster_corr, sorted_clusters = cluster_corr_matrix(p_corr, k)
+    ax1.imshow(sorted_cluster_corr, vmin=0.75, vmax=1)
+    boundaries = np.where(np.diff(sorted_clusters) != 0)[0] + 0.5
+    for b in boundaries:
+        ax1.axhline(b, color='k', lw=1)
+        ax1.axvline(b, color='k', lw=1)
+    unique_clusters = np.unique(sorted_clusters)
+    tick_positions = []
+    tick_labels = []
+    for c in unique_clusters:
+        idx = np.where(sorted_clusters == c)[0]
+        mid = (idx[0] + idx[-1]) / 2
+        tick_positions.append(mid)
+        tick_labels.append(str(c))
+    ax1.set_xticks(tick_positions)
+    ax1.set_xticklabels(tick_labels)
+    ax1.set_yticks(tick_positions)
+    ax1.set_yticklabels(tick_labels)
+    ax1.set_title(f'Clustered PCorr Matrix (k={k})')
+    ax1.set_xlabel('Cluster ID')
+
+    cmap = plt.get_cmap(CMAP_CLUSTER, k)
+    norm = BoundaryNorm(np.arange(0.5, k + 1.5), cmap.N)
+    n = sorted_cluster_corr.shape[0]
+    dot_x = -0.03 * n  # position just left of the matrix, scaled to matrix size
+    for c, y in zip(unique_clusters, tick_positions):
+        ax1.plot(dot_x, y, marker='o', markersize=6,
+                color=cmap(norm(c)), clip_on=False,
+                markeredgecolor='k', markeredgewidth=0.4)
+    ax1.set_xlim(dot_x - 0.03 * n, n - 0.5)  
+
+    special_clusters = [1, 2, CLUSTER5_MAPPING[k]]
+    special_borders = ['red', 'black', 'blue']
+    conditions = [cluster_ids == c for c in special_clusters]
+    edge_colors = np.select(conditions, special_borders, default='k')
+    edge_widths = np.where(np.isin(cluster_ids, [1, 2, CLUSTER5_MAPPING[k]]), 1.6, 0.3)
+    sc = ax2.scatter(odors, np.arange(len(odors)), c=cluster_ids, cmap=CMAP_CLUSTER,
+                    s=20, edgecolor=edge_colors, linewidth=edge_widths)
+    ax2.set_title('Clusters by Odor/Trial')
+    ax2.set_xlabel('Odors')
+    ax2.set_ylabel('Trials')
+
+    return cluster_ids
+
+def cluster_pcorr_vary_k(neurons, odor_starts, odors):
+    p_corr = population_pcorr(neurons, odor_starts, odors, times=[SPON_START, SPON_END])
+    fig, axs = plt.subplots(2, 3, figsize=(20, 10))
+    fig.suptitle('Spontaneous (-5 to -1 secs)', fontsize=16)
+
+    cluster_pcorr_plotter(p_corr, odors, axs[0,0], axs[1,0], k=5)
+    cluster_pcorr_plotter(p_corr, odors, axs[0,1], axs[1,1], k=8)
+    cluster_pcorr_plotter(p_corr, odors, axs[0,2], axs[1,2], k=12)
+
+    plt.show()
+
+def cluster_pcorr_plots(neurons, odor_starts, odors):
+    _, _, p_corr, p_corr_sorted, _, _ = population_vector_corrs(neurons, odor_starts, odors)
+    spike_counts_spon = gen_spike_counts(neurons, odor_starts, odors, sorted=False, times=[SPON_START, SPON_END]).T
+    spike_counts_unsorted = gen_spike_counts(neurons, odor_starts, odors, sorted=False, times=[ODOR_START,ODOR_END]).T
+
+
+    fig, axs = plt.subplots(2, 3, figsize=(20, 10))
+
+    corr_img0 = axs[0,0].imshow(p_corr_sorted, vmin=0.75, vmax=1)
+    fig.colorbar(corr_img0, ax=axs[0,0])
+    odor_labels = [f'O{i}' for i in range(1, 9)]
+    block_size = 25
+    tick_positions = np.arange(block_size/2, 200, block_size)
+    axs[0,0].set_xticks(tick_positions)
+    axs[0,0].set_yticks(tick_positions)
+    axs[0,0].set_xticklabels(odor_labels)
+    axs[0,0].set_yticklabels(odor_labels)
+    axs[0,0].set_title("PCorr by Odor")
+
+    cluster_ids = cluster_pcorr_plotter(p_corr, odors, axs[0,1], axs[1,1], k=8)
+
+    pca_spont = PCA(n_components=2)
+    pca_spont.fit(spike_counts_spon)
+    X_odor_pca_unsorted = pca_spont.transform(spike_counts_unsorted)
+    sc = axs[1,0].scatter(X_odor_pca_unsorted[:, 0], X_odor_pca_unsorted[:, 1], 
+                          c=cluster_ids, cmap='tab10', s=20, edgecolor='k', linewidth=0.3)
+    handles, _ = sc.legend_elements()
+    axs[1,0].legend(handles, [f'Cluster {c}' for c in np.unique(cluster_ids)],
+                    title='Cluster', loc='best', fontsize=8)
+    axs[1,0].set_xlabel('Spontaneous PC1')
+    axs[1,0].set_ylabel('Spontaneous PC2')
+    axs[1,0].set_title('Clusters onto Spontaneous PCs')
+
+    plt.show()
 
 def plot_corr_pop_vector(neurons, odor_starts, odors):
     corr_L1, corr_L2, p_corr, p_corr_sorted, p_corr_avgs, corrs_by_odor = population_vector_corrs(neurons, odor_starts, odors)
 
     # corr_L1 = corr_L1[:25, :25]
     # corr_L2 = corr_L2[:25, :25]
-    p_corr = p_corr[:25, :25]
+    # p_corr = p_corr[:25, :25]
     # o2 = p_corr_sorted[:]
 
     fig, axs = plt.subplots(1, 5, figsize=(20, 5))
@@ -692,7 +894,8 @@ def svm(neurons, odor_starts, odors):
     accuracy_linear = np.zeros(TRIALS_PER_ODOR)
     
     spike_counts = gen_spike_counts(neurons, odor_starts, odors, sorted=True, times=[ODOR_START,ODOR_END]).T
-    spike_counts_spontaneous = gen_spike_counts(neurons, odor_starts, odors, sorted=True, times=[-12,-2]).T
+    spike_counts_spontaneous, odors_spon = gen_spike_counts(neurons, odor_starts, odors, sorted=True, return_odors=True, times=[-12,-2])
+    spike_counts_spontaneous = spike_counts_spontaneous.T
 
     loo = LeaveOneOut()
     clf_linear = SVC(kernel='linear', C=100)
@@ -756,7 +959,8 @@ def svm(neurons, odor_starts, odors):
     svm_movement = []
     axis = -1
 
-    X_odor_pca = pca_spont.transform(spike_counts)
+    # X_odor_pca = pca_spont.transform(spike_counts)
+    X_odor_pca = pca_spont.transform(spike_counts_spontaneous)
 
     padding_x, padding_y = 70, 0.5
     x_min, x_max = X_odor_pca[:, 0].min() - padding_x, X_odor_pca[:, 0].max() + padding_x
@@ -784,12 +988,19 @@ def svm(neurons, odor_starts, odors):
         center = -b * w / np.dot(w, w)
         svm_movement.append(center)
 
+
+        odor_colors = np.array(['#e6194b', '#3cb44b', '#4363d8', '#f58231',
+                         '#911eb4', '#42d4f4', '#f032e6', '#bfef45'])
         if n_novel in [3, 10, 17]: 
-            # axs[axis+1].contourf(xx, yy, Z_linear, levels=[-np.inf, 0, np.inf], colors=['#AAAAFF', '#FFAAAA'], alpha=0.3)
-            # axs[axis+1].contour(xx, yy, Z_linear, levels=[0], colors='k', linewidths=2, label=f'Z_min = {Z_linear.min()}, Z_max = {Z_linear.max()}')
-            scatter = axs[axis+1].scatter(X_odor_pca[:, 0], X_odor_pca[:, 1], c=Y, cmap='coolwarm', edgecolor='k', s=40)
-            handles, _ = scatter.legend_elements()
-            axs[axis+1].legend(handles, ['Novel', 'Familiar'], loc="upper right")
+            point_colors = odor_colors[odors_spon - 1]
+            scatter = axs[axis+1].scatter(X_odor_pca[:, 0], X_odor_pca[:, 1], c=point_colors, edgecolor='k', s=40)
+
+            # Build the legend manually since we're not using a colormap
+            handles = [plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=c, markeredgecolor='k', markersize=8) for c in odor_colors]
+            axs[axis+1].legend(handles, [f'Odor {i}' for i in range(1, 9)], loc="upper right", ncol=2, fontsize=8)
+            # scatter = axs[axis+1].scatter(X_odor_pca[:, 0], X_odor_pca[:, 1], c=odors_spon, cmap='coolwarm', edgecolor='k', s=40)
+            # handles, _ = scatter.legend_elements()
+            # axs[axis+1].legend(handles, ['Novel', 'Familiar'], loc="upper right")
             # axs[axis+1].set_title(f"2D Linear SVM, n_novel = {n_novel}\nExplained Variance: {np.sum(pca_spont.explained_variance_ratio_)*100:.1f}%")
             axs[axis+1].set_title(f"n_novel = {n_novel}\nExplained Variance: {np.sum(pca_spont.explained_variance_ratio_)*100:.1f}%")
             axs[axis+1].set_xlabel("Spontaneous PC 1")
@@ -800,8 +1011,8 @@ def svm(neurons, odor_starts, odors):
     svm_movement = np.array(svm_movement)   
 
 
-    spike_counts_unsorted = gen_spike_counts(neurons, odor_starts, odors, sorted=False, times=[ODOR_START,ODOR_END]).T
-    X_odor_pca_unsorted = pca_spont.transform(spike_counts_unsorted)
+    spike_counts_spontaneous_unsorted = gen_spike_counts(neurons, odor_starts, odors, sorted=False, times=[-12,-2]).T
+    X_odor_pca_unsorted = pca_spont.transform(spike_counts_spontaneous_unsorted)
     colors = np.arange(X_odor_pca_unsorted.shape[0])
     scatter = axs[3].scatter(
         X_odor_pca_unsorted[:, 0],
@@ -829,7 +1040,7 @@ def svm(neurons, odor_starts, odors):
     # )
     axs[3].set_xlim(x_min, x_max)
     axs[3].set_ylim(y_min, y_max)
-    axs[3].set_title("Odor-Evoked Population Response")
+    axs[3].set_title("Spontaneous Population Response")
     axs[3].set_xlabel("Spontaneous PC 1")
     axs[3].set_ylabel("Spontaneous PC 2")
     
@@ -915,8 +1126,10 @@ def odor_trial_split(neurons, odor_starts, odors):
     plt.show()
 
 def mean_pop_firing_rate(neurons, odor_starts, odors):
-    spike_counts = gen_spike_counts(neurons, odor_starts, odors, sorted=True, times=[ODOR_START,ODOR_END])
-    X = spike_counts.reshape(1007, 8, 25)/(ODOR_END - ODOR_START)
+    # spike_counts = gen_spike_counts(neurons, odor_starts, odors, sorted=True, times=[ODOR_START,ODOR_END])
+    spike_counts = gen_spike_counts(neurons, odor_starts, odors, sorted=True, times=[ODOR_START-4,ODOR_START])
+    # X = spike_counts.reshape(1007, 8, 25)/(ODOR_END - ODOR_START)
+    X = spike_counts.reshape(1007, 8, 25)/4
 
     mean = X.mean(axis=(0,1))
     std  = X.std(axis=(0,1))
@@ -925,7 +1138,208 @@ def mean_pop_firing_rate(neurons, odor_starts, odors):
     plt.style.use('seaborn-v0_8-talk')
     plt.xlabel("# of Odor Presentations")
     plt.ylabel("Firing Rate (Hz)")
-    plt.title(f"{DIR}: Mean Odor Evoked Response Firing Rate")
+    plt.title(f"{DIR}: Mean Spontaneous Response Firing Rate")
+    plt.show()
+
+
+def pre_post_time_series(neurons, odor_starts, odors):
+    BIAS = 500
+    fig, axs = plt.subplots(1, 2, figsize=(20, 10))
+
+    spike_counts_unsorted = gen_spike_counts(neurons, odor_starts, odors, sorted=False, times=[ODOR_START,ODOR_END]).T
+    spike_counts_spon = gen_spike_counts(neurons, odor_starts, odors, sorted=False, times=[SPON_START, SPON_END]).T
+
+    spike_counts_pre_odor = gen_spike_counts_outside_trials(neurons, odor_starts[0], NUM_PRE_POST, DURATION_PRE_POST, INTERVAL_PRE_POST).T
+    spike_counts_post_odor = gen_spike_counts_outside_trials(neurons, odor_starts[-1], NUM_PRE_POST, DURATION_PRE_POST, -INTERVAL_PRE_POST).T
+
+    pca_spont = PCA(n_components=2)
+    pca_spont.fit(spike_counts_spon)
+    X_odor_pca_unsorted = pca_spont.transform(spike_counts_unsorted)
+    X_pre_odor_pca = pca_spont.transform(spike_counts_pre_odor)
+    X_post_odor_pca = pca_spont.transform(spike_counts_post_odor)
+
+    X_pre_post_combined = np.vstack([X_pre_odor_pca, X_post_odor_pca])
+
+    sc1 = axs[0].scatter(np.abs(X_odor_pca_unsorted[:, 0]), X_odor_pca_unsorted[:, 1] + BIAS, c=np.arange(N_TRIALS), cmap='RdBu_r', s=20, edgecolor='k', linewidth=0.3)
+    sc2 = axs[0].scatter(np.abs(X_pre_post_combined[:, 0]), X_pre_post_combined[:, 1] + BIAS, c=np.arange(2*NUM_PRE_POST), cmap='BuPu_r', s=20, edgecolor='k', linewidth=0.3)
+    cbar2 = plt.colorbar(sc2, location='left', fraction=0.046, pad=0.2)
+    cbar2.set_label('Pre-to-Post Number')
+    axs[0].set_xlabel('|Spontaneous PC1|')
+    axs[0].set_ylabel('Spontaneous PC2')
+    axs[0].set_xscale('log')
+    axs[0].set_yscale('log')
+
+    sc1 = axs[1].scatter(X_odor_pca_unsorted[:, 0], X_odor_pca_unsorted[:, 1], c=np.arange(N_TRIALS), cmap='RdBu_r', s=20, edgecolor='k', linewidth=0.3)
+    cbar1 = plt.colorbar(sc1, location='right', fraction=0.046, pad=0.04)
+    cbar1.set_label('Trial number')
+    axs[1].set_xlabel('Spontaneous PC1')
+    axs[1].set_ylabel('Spontaneous PC2')
+
+    plt.show()
+
+def single_unit_regression(neurons, odor_starts, odors):  
+    # N_TRIALS x N_NEURONS
+    spike_counts_unsorted = gen_spike_counts(neurons, odor_starts, odors, sorted=False, times=[ODOR_START,ODOR_END]).T
+    spike_counts_spon = gen_spike_counts(neurons, odor_starts, odors, sorted=False, times=[SPON_START, SPON_END]).T
+
+    trial_nums = np.arange(N_TRIALS)
+
+    slopes = np.zeros(N_NEURONS)
+    intercepts = np.zeros(N_NEURONS)
+    r_values = np.zeros(N_NEURONS)
+    p_values = np.zeros(N_NEURONS)
+
+    l2 = np.linalg.norm(spike_counts_unsorted, axis=1) 
+    l2_spon = np.linalg.norm(spike_counts_spon, axis=1) 
+    
+    fig, axs = plt.subplots(2, 3, figsize=(18, 10))
+    axs[0,0].plot(trial_nums, l2, label='odor-evoked')
+    axs[0,0].plot(trial_nums, l2_spon, label='spontaneous')
+    axs[0,0].legend()
+    axs[0,0].set_xlabel('Trial Number')
+    axs[0,0].set_ylabel('L2 Population Response')
+    axs[0,0].set_title('Magnitude of Population Response By Trial')
+
+    # -------ANALYZE SPONTANEOUS--------
+    spike_counts_unsorted = spike_counts_spon
+    # -------ANALYZE SPONTANEOUS--------
+
+    for i in range(N_NEURONS):
+        slopes[i], intercepts[i], r_values[i], p_values[i], se = stats.linregress(trial_nums, spike_counts_unsorted[:, i])
+
+    # Correct for multiple comparisons (Benjamini-Hochberg FDR)
+    reject, _, _, _ = multipletests(p_values, alpha=0.05, method='fdr_bh')
+
+    print(f"Significant neurons: {reject.sum()} / {N_NEURONS}")
+    print(f"  Increasing: {(reject & (slopes > 0)).sum()}")
+    print(f"  Decreasing: {(reject & (slopes < 0)).sum()}")
+    
+    slopes_sorted = np.argsort(slopes)
+    min, max = slopes_sorted[0], slopes_sorted[-1]
+
+    colors = np.where(reject, np.where(slopes > 0, 'crimson', 'steelblue'), 'lightgray')
+    axs[0,1].bar(np.arange(N_NEURONS), slopes, color=colors)
+    axs[0,1].annotate(f'{min+1}', xy=(min, slopes[min]),
+                    textcoords="offset points", xytext=(4, 4), fontsize=7, weight='bold')
+    axs[0,1].annotate(f'{max+1}', xy=(max, slopes[max]),
+                    textcoords="offset points", xytext=(4, 4), fontsize=7, weight='bold')
+    axs[0,1].axhline(0, color='k', linewidth=0.8)
+    axs[0,1].set_xlabel('Unit')
+    axs[0,1].set_ylabel('Firing rate vs. trial slope')
+    axs[0,1].set_title('Single Unit Drift Slopes')
+
+    axs[0,2].plot(trial_nums, spike_counts_unsorted[:, max], color='crimson', label=f'Unit {max+1}')
+    axs[0,2].plot(trial_nums, spike_counts_unsorted[:, min], color='steelblue', label=f'Unit {min+1}')
+    axs[0,2].set_xlabel('Trial number')
+    axs[0,2].set_ylabel('Firing rate')
+    axs[0,2].set_title('Units with greatest Δ firing rate')
+    axs[0,2].legend()
+
+
+    # Identify which PC correlates with trial number
+    pca_spont = PCA(n_components=2)
+    pca_spont.fit(spike_counts_spon)
+    X_odor_pca_unsorted = pca_spont.transform(spike_counts_unsorted)
+
+    reg = LinearRegression().fit(trial_nums.reshape(-1, 1), X_odor_pca_unsorted)
+    drift_direction = reg.coef_.flatten()  # regression coefficients of odor-evoked response in odor pca
+    drift_direction_unit = drift_direction / np.linalg.norm(drift_direction)
+
+    print(f"Drift direction (unit vector in PC1/PC2 space): {drift_direction_unit}")
+    print(f"  -> angle from PC1 axis: {np.degrees(np.arctan2(drift_direction_unit[1], drift_direction_unit[0])):.1f} deg")
+    
+    projection_onto_drift = X_odor_pca_unsorted @ drift_direction_unit  # shape (n_trials,)
+    r_drift, p_drift = stats.pearsonr(trial_nums, projection_onto_drift)
+    print(f"Projection vs trial number: r={r_drift:.3f}, p={p_drift:.4g}")
+
+    sc1 = axs[1,0].scatter(X_odor_pca_unsorted[:, 0], X_odor_pca_unsorted[:, 1], c=trial_nums, cmap='RdBu_r', s=20, edgecolor='k', linewidth=0.3)
+    cbar1 = plt.colorbar(sc1, label='Trial number')
+
+    # overlay the fitted drift direction as an arrow from the data centroid
+    centroid = X_odor_pca_unsorted.mean(axis=0)
+    arrow_scale = np.ptp(X_odor_pca_unsorted[:, 0]) * 0.25  # scale arrow to plot size
+
+    print(f'CENTROID: {centroid}, DRIFT DIR: {drift_direction_unit}, arrow scale: {arrow_scale}')
+
+    axs[1,0].annotate('', xy=centroid + arrow_scale*drift_direction_unit, xytext=centroid - arrow_scale*drift_direction_unit,
+                arrowprops=dict(arrowstyle='-|>', color='crimson', lw=2))
+    axs[1,0].set_xlabel('Spontaneous PC1')
+    axs[1,0].set_ylabel('Spontaneous PC2')
+    axs[1,0].set_title(f'Spontaneous Drift Axis')
+
+
+    drift_loadings_full = drift_direction_unit @ pca_spont.components_  # shape (n_neurons,)
+    neg_unit, pos_unit = np.argmin(drift_loadings_full), np.argmax(drift_loadings_full)
+
+    r_check, p_check = stats.pearsonr(drift_loadings_full, slopes)
+    print(f"Composite drift loading vs. single-unit slope: r={r_check:.3f}, p={p_check:.4g}")
+
+    colors = np.where(~reject, 'lightgray', np.where(slopes > 0, 'crimson', 'steelblue'))
+    axs[1,1].scatter(drift_loadings_full, slopes, c=colors,
+                edgecolor='k', s=40, alpha=0.8)
+    axs[1,1].annotate(neg_unit+1, (drift_loadings_full[neg_unit], slopes[neg_unit]),
+                   textcoords="offset points", xytext=(4, 4), fontsize=7, weight='bold')
+    axs[1,1].annotate(pos_unit+1, (drift_loadings_full[pos_unit], slopes[pos_unit]),
+                   textcoords="offset points", xytext=(4, 4), fontsize=7, weight='bold')
+    axs[1,1].annotate(max+1, (drift_loadings_full[max], slopes[max]),
+                   textcoords="offset points", xytext=(4, 4), fontsize=7, weight='bold')
+    axs[1,1].set_xlabel('Loading Component')
+    axs[1,1].set_ylabel('Firing rate vs. trial slope')
+    axs[1,1].axhline(0, color='gray', lw=0.5)
+    axs[1,1].axvline(0, color='gray', lw=0.5)
+    axs[1,1].set_title(f'ΔFiring rate wrt loading component r={r_check:.3f}')
+
+    axs[1,2].plot(trial_nums, spike_counts_unsorted[:, pos_unit], color='crimson', label=f'Unit {pos_unit+1}')
+    axs[1,2].plot(trial_nums, spike_counts_unsorted[:, neg_unit], color='steelblue', label=f'Unit {neg_unit+1}')
+    axs[1,2].set_xlabel('Trial Number')
+    axs[1,2].set_ylabel('Firing Rate')
+    axs[1,2].set_title(f'Top Contributing Unit Spike Counts')
+    axs[1,2].legend()
+
+    # Get that PC's neuron loadings
+    # drift_loadings = pca_components[drift_pc, :]  # shape (n_neurons,)
+
+    # # Correlate loadings with regression slopes
+    # loading_slope_r, loading_slope_p = stats.pearsonr(drift_loadings, slopes)
+    # print(f"Loading vs. slope correlation: r={loading_slope_r:.3f}, p={loading_slope_p:.4f}")
+
+    # axs[3].scatter(drift_loadings, slopes, c=np.where(reject, 'crimson', 'lightgray'),
+    #             edgecolor='k', s=40, alpha=0.8)
+    # axs[3].set_xlabel(f'PC{drift_pc+1} loading')
+    # axs[3].set_ylabel('Firing rate vs. trial slope')
+    # axs[3].set_title(f'r={loading_slope_r:.2f}, p={loading_slope_p:.4f}')
+    # axs[3].axhline(0, color='gray', linewidth=0.5)
+    # axs[3].axvline(0, color='gray', linewidth=0.5)
+
+    plt.show()
+
+
+def run_pca(pc_set, projection_set, dimensions):
+    pca = PCA(n_components=dimensions)
+    pca.fit(pc_set)
+    return pca.transform(projection_set), np.sum(pca.explained_variance_ratio_)
+
+def cluster_in_pca_space(neurons, odor_starts, odors, k_list, d_list):
+    fig, axs = plt.subplots(3, 3, figsize=(15, 9))
+    spike_counts_unsorted = gen_spike_counts(neurons, odor_starts, odors, sorted=False, times=[ODOR_START,ODOR_END]).T
+    spike_counts_spon = gen_spike_counts(neurons, odor_starts, odors, sorted=False, times=[SPON_START, SPON_END]).T
+
+    for i, d in enumerate(d_list):
+        X_odor_pca_unsorted, variance_captured = run_pca(spike_counts_spon, spike_counts_unsorted, dimensions=d)
+
+        for j, k in enumerate(k_list):
+            Z = linkage(X_odor_pca_unsorted, method='average')
+            cluster_ids = fcluster(Z, t=k, criterion='maxclust')
+
+            edge_colors = np.where(cluster_ids == cluster_ids[1], 'red', 'k')
+            edge_widths = np.where(cluster_ids == cluster_ids[1], 1.6, 0.3)
+            axs[i,j].scatter(odors, np.arange(len(odors)), c=cluster_ids, cmap=CMAP_CLUSTER,
+                                s=20, edgecolor=edge_colors, linewidth=edge_widths)
+            axs[i,j].set_title(f'{k} Clusters, {d} Dimensions, {variance_captured*100:.2f}%')
+            axs[i,j].set_xlabel('Odors')
+            axs[i,j].set_ylabel('Trials')
+
+    plt.tight_layout()
     plt.show()
 
 def main():
@@ -960,10 +1374,16 @@ def main():
     # trial_zscores(neurons, odor_starts, odors)
     # axs = delta(neurons, odor_starts, odors, operator.mul)
     # x(neurons, odor_starts, odors, axs)
-    svm(neurons, odor_starts, odors)
+    # svm(neurons, odor_starts, odors)
     # odor_trial_split(neurons, odor_starts, odors)
     # mean_pop_firing_rate(neurons, odor_starts, odors)
+    # single_unit_regression(neurons, odor_starts, odors)
+    pre_post_time_series(neurons, odor_starts, odors)
+    # cluster_pcorr_plots(neurons, odor_starts, odors)
+    # cluster_pcorr_vary_k(neurons, odor_starts, odors)
     
+    # cluster_in_pca_space(neurons, odor_starts, odors, k_list=[5, 8, 12], d_list=[50, 100, 200])
+    # pcorr_pre_post_plotter(neurons, odor_starts, odors)
 
 
 if __name__ == "__main__":
