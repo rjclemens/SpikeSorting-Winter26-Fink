@@ -36,6 +36,7 @@ TRIALS_PER_ODOR = int(N_TRIALS / N_ODORS)
 
 N_ZSCORES = 504
 N_BINS = 120
+N_NULL_TRIALS = 1000
 
 START = -2
 ODOR_START = 0
@@ -562,7 +563,7 @@ def plot_corr_pop_vector(neurons, odor_starts, odors):
     axs[1].set_yticks(tick_positions)
     axs[1].set_xticklabels(odor_labels)
     axs[1].set_yticklabels(odor_labels)
-    axs[1].set_title("Pear Corr by Odor")
+    axs[1].set_title("Pearson's Corr by Odor")
 
     corr_img2 = axs[2].imshow(p_corr, vmin=0.75, vmax=1)
     # fig.colorbar(corr_img2, ax=axs[2])
@@ -1442,13 +1443,16 @@ def plot_drift_across_presentations(neurons, odor_starts, odors):
         return delta_pop_vector_matrix, means_by_trial, stds_by_trial
 
     def drift_explained_by_pc(spike_counts):
-        def calc_avg_drift_vector(spike_counts):
+        def compute_drift_vectors(spike_counts):
+            """
+            returns (192 x 1007)
+            """
             drift_vectors = np.zeros((N_ODORS, TRIALS_PER_ODOR-1, N_NEURONS))
             for i in range(N_ODORS):
                 in_odor_group = spike_counts[i*TRIALS_PER_ODOR : (i+1)*TRIALS_PER_ODOR]
                 for j in range(TRIALS_PER_ODOR-1):
-                    drift_vectors[i, j, :] = in_odor_group[j] - in_odor_group[j+1]
-            return np.mean(drift_vectors, axis=0)
+                    drift_vectors[i, j, :] = in_odor_group[j+1] - in_odor_group[j]
+            return drift_vectors.reshape(N_ODORS * (TRIALS_PER_ODOR - 1), N_NEURONS) 
         
         pca = PCA(n_components=np.min(spike_counts.shape))
         splkes_pca = pca.fit_transform(spike_counts)
@@ -1458,65 +1462,280 @@ def plot_drift_across_presentations(neurons, odor_starts, odors):
         effective_d = 30
 
         spikes_pca_components = pca.components_[:effective_d, :]
-
-        avg_drift_vector = calc_avg_drift_vector(spike_counts).T
+        drift_vectors = compute_drift_vectors(spike_counts).T # 1007 x 192
 
         # pca components chosen such that drift projection >= 0
-        gamma = np.abs(spikes_pca_components @ avg_drift_vector)  # (12, 1007) @ (1007, 24) = (12, 24)
-        gamma /= np.linalg.norm(avg_drift_vector, axis=0) # divide by drift norm
+        gamma = np.abs(spikes_pca_components @ drift_vectors)  # (12, 1007) @ (1007, 192) = (12, 192)
+        gamma /= np.linalg.norm(drift_vectors, axis=0) # divide by drift norm
 
-        return gamma, pca_vars[:effective_d]/pca_vars[0]  # normalized to PC 1 variance
+        pc_drift_angles = np.degrees(np.arccos(gamma))
+
+        return gamma, pc_drift_angles, pca_vars[:effective_d]/pca_vars[0]  # normalized to PC 1 variance
+
+    def null_dists(spike_counts, n_null_trials, operation):
+        spike_counts_arr = spike_counts.flatten()
+
+        rng = np.random.default_rng()
+        shuffle_indices = np.argsort(rng.random(spike_counts.shape), axis=0)
+        col_shuffled_spike_counts = np.take_along_axis(spike_counts, shuffle_indices, axis=0)
+
+        null_dist_rand_element = np.zeros(n_null_trials)
+        null_dist_rand_vector = np.zeros(n_null_trials)
+        null_dist_rand = np.zeros(n_null_trials)
+        null_dist_col_shuffle = np.zeros(n_null_trials)
+
+        for i in range(n_null_trials):
+            # draw from all spiking rates
+            v1_rand = np.random.choice(spike_counts_arr, size=N_NEURONS, replace=False)
+            v2_rand = np.random.choice(spike_counts_arr, size=N_NEURONS, replace=False)
+            null_dist_rand_element[i] = operation(v1_rand, v2_rand)
+
+            # row shuffle
+            rand_idxs = np.random.choice(spike_counts.shape[0], size=2, replace=False)
+            v1_rand = spike_counts[rand_idxs[0]]
+            v2_rand = spike_counts[rand_idxs[1]]
+            null_dist_rand_vector[i] = operation(v1_rand, v2_rand)
+
+            # draw from all floats (-.5, .5)
+            v1_rand = np.random.rand(N_NEURONS) - 0.5
+            v2_rand = np.random.rand(N_NEURONS) - 0.5
+            null_dist_rand[i] = operation(v1_rand, v2_rand)
+
+            # column shuffle: for each unit, preserve distribution of spiking rates across trials
+            rand_idxs = np.random.choice(col_shuffled_spike_counts.shape[0], size=2, replace=False)
+            v1_rand = col_shuffled_spike_counts[rand_idxs[0]]
+            v2_rand = col_shuffled_spike_counts[rand_idxs[1]]
+            null_dist_col_shuffle[i] = operation(v1_rand, v2_rand)
+
+        return null_dist_rand_element, null_dist_rand_vector, null_dist_rand, null_dist_col_shuffle
+
+    def calc_inter_odor_corr(pcorr_by_odor):
+        pcorr_angles = np.degrees(np.arccos(pcorr_by_odor))
+
+        diag_row_blocks = np.arange(N_TRIALS)[:, None] // TRIALS_PER_ODOR
+        diag_col_blocks = np.arange(N_TRIALS)[None, :] // TRIALS_PER_ODOR
+        diag_block_mask = (diag_row_blocks == diag_col_blocks)
+
+        inter_odor_corr = pcorr_angles[~diag_block_mask]
+        in_odor_corr = pcorr_angles[diag_block_mask]
+
+        return inter_odor_corr, in_odor_corr
+    
+    def calc_inter_odor_drift(pcorr_by_odor):
+        inter_odor_corr = np.zeros(TRIALS_PER_ODOR)
+        inter_odor_dist = np.zeros((TRIALS_PER_ODOR, N_ODORS * (N_ODORS - 1))) # (25, 56)
+        first_trials = np.arange(N_ODORS) * TRIALS_PER_ODOR
         
 
+        for i in range(TRIALS_PER_ODOR):
+            ith_idx = first_trials + i
+            all_pairs = np.degrees(np.arccos(pcorr_by_odor[np.ix_(first_trials, ith_idx)])) # all pairs of OA (1st) with OB (ith)
+            all_inter_odor_pairs = all_pairs[~np.eye(N_ODORS, dtype=bool)] # mask out A = B
+
+            inter_odor_dist[i, :] = all_inter_odor_pairs
+            inter_odor_corr[i] = np.mean(all_inter_odor_pairs)
+
+        return inter_odor_corr, inter_odor_dist
+
+
     spike_counts = gen_spike_counts(neurons, odor_starts, odors, sorted=True, times=[ODOR_START,ODOR_END]).T
+    spike_counts_spon = gen_spike_counts(neurons, odor_starts, odors, sorted=True, times=[SPON_START, SPON_END]).T
+    spike_counts_pre = gen_spike_counts_outside_trials(neurons, odor_starts[0], NUM_PRE_POST, DURATION_PRE_POST, INTERVAL_PRE_POST).T
+    spike_counts_post = gen_spike_counts_outside_trials(neurons, odor_starts[-1], NUM_PRE_POST, DURATION_PRE_POST, -INTERVAL_PRE_POST).T
 
-    fig, axs = plt.subplots(2, 1, figsize=(9,10))
-    pop_vector_angles, drift_means, drift_stds = drift_across_presentations(spike_counts, angle_between)
-    pop_vector_corr_angles, drift_corr_means, drift_corr_stds = drift_across_presentations(spike_counts, corr_angle_between)
+    pcorr_by_odor =  np.corrcoef(spike_counts, rowvar=True)
+    pcorr_by_odor_spon =  np.corrcoef(spike_counts_spon, rowvar=True)
 
-    pop_vector_angles_from_p0, drift_means_p0, drift_stds_p0 = drift_across_presentations(spike_counts, angle_between, compare_to_first=True)
-    pop_vector_corr_angles_from_p0, drift_corr_means_p0, drift_corr_stds_p0 = drift_across_presentations(spike_counts, corr_angle_between, compare_to_first=True)
+    spike_types = [spike_counts, spike_counts_spon, spike_counts_pre, spike_counts_post]
+    plt_titles = ['Odor Evoked (0-4s)', 'Spontaneous (-5 to -1s)', 'Pre-Odor', 'Post-Odor']
 
-    drift_pair_space = np.arange(1, TRIALS_PER_ODOR)
-    for i in range(N_ODORS):
-        axs[0].scatter(drift_pair_space, pop_vector_angles[i, :], color='blue', s=15, alpha=0.6, label='drift' if i == 0 else None)
-        axs[0].scatter(drift_pair_space, pop_vector_corr_angles[i, :], color='orange', s=15, alpha=0.6, label='mean-subtracted drift' if i == 0 else None)
+    # fig, axs = plt.subplots(2, 2, figsize=(15,9))
+    # pop_vector_angles, drift_means, drift_stds = drift_across_presentations(spike_counts, angle_between)
+    # pop_vector_corr_angles, drift_corr_means, drift_corr_stds = drift_across_presentations(spike_counts, corr_angle_between)
 
-        axs[1].scatter(ODOR_PRESENTATION_SPACE, pop_vector_angles_from_p0[i, :], color='blue', s=15, alpha=0.6, label='drift from first presentation' if i == 0 else None)
-        axs[1].scatter(ODOR_PRESENTATION_SPACE, pop_vector_corr_angles_from_p0[i, :], color='orange', s=15, alpha=0.6, label='mean-subtracted drift from first presentation' if i == 0 else None)
+    # pop_vector_angles_from_p0, drift_means_p0, drift_stds_p0 = drift_across_presentations(spike_counts, angle_between, compare_to_first=True)
+    # pop_vector_corr_angles_from_p0, drift_corr_means_p0, drift_corr_stds_p0 = drift_across_presentations(spike_counts, corr_angle_between, compare_to_first=True)
 
-    axs[0].set_xlabel('Presentation pair (n, n+1)')
-    axs[0].errorbar(drift_pair_space, drift_means, yerr=drift_stds, fmt='o-', color='blue', ecolor='blue', capsize=3, label='± 1 std')
-    axs[0].errorbar(drift_pair_space, drift_corr_means, yerr=drift_corr_stds, fmt='o-', color='orange', ecolor='orange', capsize=3)
+    # drift_pair_space = np.arange(1, TRIALS_PER_ODOR)
+    # for i in range(N_ODORS):
+    #     axs[0,0].scatter(drift_pair_space, pop_vector_angles[i, :], color='blue', s=15, alpha=0.6, label='drift' if i == 0 else None)
+    #     axs[0,0].scatter(drift_pair_space, pop_vector_corr_angles[i, :], color='orange', s=15, alpha=0.6, label='mean-subtracted drift' if i == 0 else None)
 
-    axs[1].set_xlabel('Drift from initial presentation (0, n)')
-    axs[1].errorbar(ODOR_PRESENTATION_SPACE, drift_means_p0, yerr=drift_stds_p0, fmt='o-', color='blue', ecolor='blue', capsize=3, label='± std')
-    axs[1].errorbar(ODOR_PRESENTATION_SPACE, drift_corr_means_p0, yerr=drift_corr_stds_p0, fmt='o-', color='orange', ecolor='orange', capsize=3, label='± std')
+    #     axs[1,0].scatter(ODOR_PRESENTATION_SPACE, pop_vector_angles_from_p0[i, :], color='blue', s=15, alpha=0.6, label='drift from first presentation' if i == 0 else None)
+    #     axs[1,0].scatter(ODOR_PRESENTATION_SPACE, pop_vector_corr_angles_from_p0[i, :], color='orange', s=15, alpha=0.6, label='mean-subtracted drift from first presentation' if i == 0 else None)
 
-    for ax in axs:
-        ax.set_ylabel('Mean drift (deg)')
-        ax.set_xticks(drift_pair_space) 
+    # axs[0,0].set_xlabel('Presentation pair (n, n+1)')
+    # axs[0,0].set_ylabel('Mean drift (deg)')
+    # axs[0,0].set_xticks(drift_pair_space) 
+    # axs[0,0].errorbar(drift_pair_space, drift_means, yerr=drift_stds, fmt='o-', color='blue', ecolor='blue', capsize=3, label='± 1 std')
+    # axs[0,0].errorbar(drift_pair_space, drift_corr_means, yerr=drift_corr_stds, fmt='o-', color='orange', ecolor='orange', capsize=3)
+    # axs[0,0].legend()
 
-    axs[0].legend()
+    # axs[1,0].set_xlabel('Drift from initial presentation (0, n)')
+    # axs[1,0].set_ylabel('Mean drift (deg)')
+    # axs[1,0].set_xticks(drift_pair_space)
+    # axs[1,0].errorbar(ODOR_PRESENTATION_SPACE, drift_means_p0, yerr=drift_stds_p0, fmt='o-', color='blue', ecolor='blue', capsize=3, label='± std')
+    # axs[1,0].errorbar(ODOR_PRESENTATION_SPACE, drift_corr_means_p0, yerr=drift_corr_stds_p0, fmt='o-', color='orange', ecolor='orange', capsize=3, label='± std')
 
-    fig, axs = plt.subplots(2, 1, figsize=(9,10))
-    gamma, explained_variances = drift_explained_by_pc(spike_counts)  # (12, 24)
-    gamma_means = np.mean(gamma, axis=1)
+    corr_angles = np.zeros((3, N_ODORS, TRIALS_PER_ODOR))
+    corr_means = np.zeros((3, TRIALS_PER_ODOR))
+    corr_stds = np.zeros((3, TRIALS_PER_ODOR))
 
-    for i in range(TRIALS_PER_ODOR-1):
-        axs[0].scatter(explained_variances, gamma[:, i], color='red', s=15, alpha=0.6, label='drift along each PC' if i == 0 else None)
+    for i, spikes in enumerate(spike_types[:2]):
+        corr_angles[i], corr_means[i], corr_stds[i] = drift_across_presentations(spikes, corr_angle_between, compare_to_first=True)
+        
+    fig, axs = plt.subplots(2, 2, figsize=(15,9))
+    for i in range(2):
+        h_ax, v_ax = i // 2, i % 2
+        for j in range(N_ODORS):
+            axs[h_ax, v_ax].scatter(ODOR_PRESENTATION_SPACE, corr_angles[i, j, :], color='orange', s=15, alpha=0.6, label='mean-subtracted drift from first presentation' if j == 0 else None)
 
-    popt, _ = curve_fit(exp_func, explained_variances, gamma_means, p0=(1, 1, 0), maxfev=5000)
-    x_fit = np.linspace(min(explained_variances), max(explained_variances), 200)
-    axs[0].plot(x_fit, exp_func(x_fit, *popt), '-', color='black', label='exponential fit')
+        axs[h_ax, v_ax].set_xlabel('Drift from initial presentation (0, n)')
+        axs[h_ax, v_ax].set_ylabel('Mean drift (deg)')
+        axs[h_ax, v_ax].set_title(f'Mean-subtracted drift: {plt_titles[i]}')
+        axs[h_ax, v_ax].set_xticks(ODOR_PRESENTATION_SPACE)
+        axs[h_ax, v_ax].errorbar(ODOR_PRESENTATION_SPACE, corr_means[i], yerr=corr_stds[i], fmt='o-', color='blue', ecolor='blue', capsize=3, label='± std')
+        axs[h_ax, v_ax].legend()
+
+    inter_odor_corrs, inter_odor_dist = calc_inter_odor_drift(pcorr_by_odor)
+    axs[1, 0].plot(ODOR_PRESENTATION_SPACE, inter_odor_corrs, 'o-', color='green', label='inter-odor drift')
+    axs[1, 0].plot(ODOR_PRESENTATION_SPACE, corr_means[0], 'o-', color='blue', label='in-odor drift')
+    axs[1, 0].set_xlabel('Drift from initial presentation (0, n)')
+    axs[1, 0].set_ylabel('Mean drift (deg)')
+    axs[1, 0].set_xticks(ODOR_PRESENTATION_SPACE)
+    axs[1, 0].legend()
+
+    #-------------------- NULL DIST PLOTS ------------------------
+
+    null_dists_rand_element = np.zeros((4, N_NULL_TRIALS))
+    null_dists_rand_vector = np.zeros((4, N_NULL_TRIALS))
+    null_dists_rand = np.zeros((4, N_NULL_TRIALS))
+    null_dists_col_shuffle = np.zeros((4, N_NULL_TRIALS))
+
+    for i, spikes in enumerate(spike_types):
+        null_dists_rand_element[i], null_dists_rand_vector[i], null_dists_rand[i], null_dists_col_shuffle[i] = null_dists(spikes, N_NULL_TRIALS, corr_angle_between)
+
+    # in/inter odor null dists
+    inter_odor_corr, in_odor_corr = calc_inter_odor_corr(pcorr_by_odor)
+    inter_odor_corr_spon, in_odor_corr_spon = calc_inter_odor_corr(pcorr_by_odor_spon)
+    inter_odor_corrs = np.vstack([inter_odor_corr, inter_odor_corr_spon])
+    in_odor_corrs = np.vstack([in_odor_corr, in_odor_corr_spon])
+
+    fig, axs = plt.subplots(2, 2, figsize=(15,9))
+    for i in range(4):
+        h_ax, v_ax = i // 2, i % 2
+        if (h_ax == 0): 
+            axs[h_ax, i].hist(inter_odor_corrs[i], bins=150, range=(0, 180), color='black', histtype='step', linewidth=1.5, 
+                              weights=np.full_like(inter_odor_corrs[i], N_NULL_TRIALS / len(inter_odor_corrs[i])), 
+                              label='inter odor corrs')
+            axs[h_ax, i].hist(in_odor_corrs[i], bins=150, range=(0, 180), color='green', histtype='step', linewidth=1.5, 
+                              weights=np.full_like(in_odor_corrs[i], N_NULL_TRIALS / len(in_odor_corrs[i])), 
+                              label='in odor corrs')
+
+        axs[h_ax, v_ax].hist(null_dists_rand_element[i], bins=150, range=(0, 180), color='steelblue', histtype='step', linewidth=1.5, label='random rates from distribution')
+        axs[h_ax, v_ax].hist(null_dists_rand_vector[i], bins=150, range=(0, 180), color='indianred', histtype='step', linewidth=1.5, label='random trial pairs')
+        axs[h_ax, v_ax].hist(null_dists_rand[i], bins=150, range=(0, 180), color='purple', histtype='step', linewidth=1.5, label='rates drawn from (-.5, .5)')
+        axs[h_ax, v_ax].hist(null_dists_col_shuffle[i], bins=150, range=(0, 180), color='orange', histtype='step', linewidth=1.5, label='unit\'s rates shuffled between trials')
+        axs[h_ax, v_ax].set_xlabel('Angle (degrees)')
+        axs[h_ax, v_ax].set_ylabel('Count')
+        axs[h_ax, v_ax].set_title(f'Mean-Subtracted Null Dist: {plt_titles[i]}')
+        axs[h_ax, v_ax].set_xlim(0, 110)
+        axs[h_ax, v_ax].legend()
+
+    # Mann Whitney odor-evoked test: drift to col shuffled (no temporal correlation)
+    fig, axs = plt.subplots(2, 2, figsize=(15,9))
+
+    n_familiar = 15
+    n_familiar2 = 20
+    n_angles = (TRIALS_PER_ODOR - n_familiar) * N_ODORS
+    n_angles2 = (TRIALS_PER_ODOR - n_familiar2) * N_ODORS
+
+
+    inter_odor_drift = inter_odor_dist[n_familiar, :].flatten()
+    inter_odor_drift2 = inter_odor_dist[n_familiar2, :].flatten()
+
+    axs[0, 0].hist(inter_odor_drift, bins=150, range=(0, 180), color='green', histtype='step', linewidth=1.5, 
+                weights=np.full_like(inter_odor_drift, n_angles / len(inter_odor_drift)), 
+                label=f'inter odor drift between 1st and late presentations (n>={n_familiar})')
+    axs[1, 0].hist(inter_odor_drift2, bins=150, range=(0, 180), color='green', histtype='step', linewidth=1.5, 
+                weights=np.full_like(inter_odor_drift2, n_angles / len(inter_odor_drift2)), 
+                label=f'inter odor drift between 1st and late presentations (n>={n_familiar2})')
+    
+    for i, spikes in enumerate(spike_types):
+        if i == 2:  # exclude pre/post odor spike counts
+            break
+
+        h_ax, v_ax = i // 2, i % 2
+        late_drift_group = corr_angles[i, :, n_familiar:].flatten()
+        early_drift_group = corr_angles[i, :, 1:n_familiar].flatten()
+        _, _, _, random_group = null_dists(spikes, n_angles, corr_angle_between)
+        p1 = mannwhitneyu(late_drift_group, random_group, alternative='two-sided')[1]
+
+        late_drift_group2 = corr_angles[i, :, n_familiar2:].flatten()
+        early_drift_group2 = corr_angles[i, :, 1:n_familiar2].flatten()
+        _, _, _, random_group2 = null_dists(spikes, n_angles2, corr_angle_between)
+        p2 = mannwhitneyu(late_drift_group2, random_group2, alternative='two-sided')[1]
+
+        axs[h_ax, v_ax].hist(late_drift_group, bins=150, range=(0, 180), color='steelblue', alpha=0.5,
+                      edgecolor='steelblue', linewidth=1.8, zorder=2, label=f'drift between 1st and late presentations (n>={n_familiar})')
+        axs[h_ax, v_ax].hist(early_drift_group, bins=150, range=(0, 180), color='red', alpha=0.15,
+                      edgecolor='none', zorder=1, label=f'drift between 1st and early presentations (n<{n_familiar})')
+        axs[h_ax, v_ax].hist(random_group, bins=150, range=(0, 180), color='orange', alpha=0.5,
+                      edgecolor='darkorange', linewidth=1.8, zorder=2, label='unit\'s rates shuffled between trials')
+        axs[h_ax, v_ax].hist(inter_odor_corrs[v_ax], bins=150, range=(0, 180), color='black', histtype='step', linewidth=1.5, 
+                      weights=np.full_like(inter_odor_corrs[i], n_angles / len(inter_odor_corrs[v_ax])), 
+                      label='inter odor corrs')
+        axs[h_ax, v_ax].set_xlabel('Angle (degrees)')
+        axs[h_ax, v_ax].set_ylabel('Count')
+        axs[h_ax, v_ax].set_title(f'Mean-Subtracted {plt_titles[i]}: p={p1:.2e}, n={n_angles}')
+        axs[h_ax, v_ax].set_xlim(0, 60)
+        axs[h_ax, v_ax].legend()
+
+        axs[h_ax+1, v_ax].hist(late_drift_group2, bins=150, range=(0, 180), color='steelblue', alpha=0.5,
+                        edgecolor='steelblue', linewidth=1.8, zorder=2, label=f'drift between 1st and late presentations (n>={n_familiar2})')
+        axs[h_ax+1, v_ax].hist(early_drift_group2, bins=150, range=(0, 180), color='red', alpha=0.15,
+                        edgecolor='none', zorder=1, label=f'drift between 1st and early presentations (n<{n_familiar2})')
+        axs[h_ax+1, v_ax].hist(random_group2, bins=150, range=(0, 180), color='orange', alpha=0.5,
+                        edgecolor='darkorange', linewidth=1.8, zorder=2, label='unit\'s rates shuffled between trials')
+        axs[h_ax+1, v_ax].hist(inter_odor_corrs[v_ax], bins=150, range=(0, 180), color='black', histtype='step', linewidth=1.5, 
+                        weights=np.full_like(inter_odor_corrs[i], n_angles2 / len(inter_odor_corrs[v_ax])), 
+                        label='inter odor corrs')
+        axs[h_ax+1, v_ax].set_xlabel('Angle (degrees)')
+        axs[h_ax+1, v_ax].set_ylabel('Count')
+        axs[h_ax+1, v_ax].set_title(f'Mean-Subtracted {plt_titles[i]}: p={p2:.2e}, n={n_angles2}')
+        axs[h_ax+1, v_ax].set_xlim(0, 60)
+
+
+    #-------------------- PC PLOTS ------------------------
+
+    # fig, axs = plt.subplots(2, 1, figsize=(9,10))
+    # gamma, pc_drift_angles, explained_variances = drift_explained_by_pc(spike_counts)  # (12, 192)
+    # gamma_means, pc_drift_angle_means = np.mean(gamma, axis=1), np.mean(pc_drift_angles, axis=1)
+    # gamma_stds = np.std(gamma, axis=1)
+
+    # for i in range(N_ODORS*(TRIALS_PER_ODOR-1)):
+    #     axs[0].scatter(explained_variances, gamma[:, i], color='red', s=15, alpha=0.15, label='drift along each PC' if i == 0 else None)
+    #     axs[1].scatter(explained_variances, pc_drift_angles[:, i], color='blue', s=15, alpha=0.15, label='PCi-drift angle' if i == 0 else None)
+
+    # x_fit = np.linspace(min(explained_variances), max(explained_variances), 200)
+    # popt, _ = curve_fit(exp_func, explained_variances, gamma_means, p0=(1, 1, 0), maxfev=5000)
+    # axs[0].plot(x_fit, exp_func(x_fit, *popt), '-', color='black', label='exponential fit')
+
+    # popt, _ = curve_fit(exp_func, explained_variances, pc_drift_angle_means, p0=(1, 1, 0), maxfev=5000)
+    # axs[1].plot(x_fit, exp_func(x_fit, *popt), '-', color='black', label='exponential fit')
 
     # axs[0].errorbar(explained_variances, gamma_means, yerr=gamma_stds, fmt='o-', color='black', ecolor='black', capsize=3, label='gamma mean ± std')
-    axs[0].set_xlabel('Variance explained, normalized to PC 1')
-    axs[0].set_ylabel('Drift projection magnitude on each PC')
-    axs[0].set_xscale('log')
-    axs[0].set_title('Drift occurs most in the direction of top PCs')
+    # axs[0].set_xlabel('Variance explained, normalized to PC 1')
+    # axs[0].set_ylabel('Drift projection magnitude on each PC')
+    # axs[0].set_xscale('log')
+    # axs[0].set_title('Drift occurs most in the direction of top PCs')
+
+    # axs[1].set_xlabel('Variance explained, normalized to PC 1')
+    # axs[1].set_ylabel('PCi-drift angle')
+    # axs[1].set_xscale('log')
 
     plt.show()
+    plt.tight_layout()
 
 def main():
 
